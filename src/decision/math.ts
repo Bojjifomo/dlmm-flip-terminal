@@ -255,3 +255,14 @@ export function confirmReady(
   const needMs = Math.max(0, needMinutes) * 60_000;
   return state.checks >= checks && nowMs - state.startedAtMs >= needMs;
 }
+
+/**
+ * Jumlah yang direncanain bisa lebih gede dari yang beneran masuk wallet (pembulatan,
+ * fee transfer, dust yang ketinggalan). Kirim lebih dari saldo = "insufficient funds".
+ * Jadi potong ke saldo nyata. Nggak pernah nambah di atas rencana. SOL native dilewatin
+ * (dicek terpisah di assertSol).
+ */
+export function capToBalance(planned: bigint, balance: bigint): bigint {
+  if (planned <= 0n) return 0n;
+  return balance < planned ? (balance > 0n ? balance : 0n) : planned;
+}

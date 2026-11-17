@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import {
   emptyState,
@@ -86,4 +86,44 @@ export function publicPending(pending: PendingAction): Omit<PendingAction, "posi
   const copy = { ...pending };
   delete copy.positionSecret;
   return copy;
+}
+
+/**
+ * Kunci satu-proses per state file. Dua bot (mis. pm2 + launchd, atau `run` + `flip`)
+ * yang jalan bareng bakal rebutan posisi yang sama: satu nutup, satunya error
+ * "Position account ... not found" atau dobel kirim tx.
+ */
+export function acquireLock(stateFile: string): () => void {
+  const lockPath = `${stateFile}.lock`;
+  mkdirSync(dirname(lockPath), { recursive: true });
+  if (existsSync(lockPath)) {
+    const pid = Number(readFileSync(lockPath, "utf8").trim());
+    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && processAlive(pid)) {
+      throw new Error(
+        `bot lain (pid ${pid}) lagi jalan pakai ${stateFile}. Stop dulu proses itu, atau hapus ${lockPath} kalau yakin udah mati.`,
+      );
+    }
+  }
+  writeFileSync(lockPath, String(process.pid));
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    try {
+      if (existsSync(lockPath) && readFileSync(lockPath, "utf8").trim() === String(process.pid)) unlinkSync(lockPath);
+    } catch {
+      // abaikan
+    }
+  };
+  process.once("exit", release);
+  return release;
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }

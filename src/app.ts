@@ -22,6 +22,7 @@ import { log } from "./logger";
 import { notify, notifyError, notifyFlipAsk, notifyStaleAsk, pollTelegram } from "./notify/telegram";
 import { decisionText, renderPending, renderPlan, renderSnapshot } from "./render";
 import {
+  acquireLock,
   cycleFromPersisted,
   findCycle,
   flipsSince,
@@ -89,6 +90,7 @@ export async function runBot(configPath: string, modeOverride?: Mode, once = fal
   const mode = modeOverride ?? config.mode;
   const wallet = loadWallet(config.walletPubkey);
   if (mode !== "dry-run") requireSigner(wallet);
+  const release = mode === "dry-run" ? () => undefined : acquireLock(config.stateFile);
   const connection = new Connection(resolveRpc(mode), config.commitment);
   log.info(`run mode=${mode} poll=${config.pollIntervalMs}ms sekali=${once}`);
   let stopping = false;
@@ -110,6 +112,7 @@ export async function runBot(configPath: string, modeOverride?: Mode, once = fal
     if (once || stopping) break;
     await sleep(config.pollIntervalMs);
   } while (!stopping);
+  release();
 }
 
 export async function flipPosition(
@@ -155,6 +158,7 @@ export async function flipPosition(
     return;
   }
   if (!result.cycle) return;
+  acquireLock(config.stateFile);
   indexCycle(state, result.cycle);
   const pending = makePending("flip", snap, result.cycle, plan, mode === "alert" ? "awaiting_confirm" : "claim", now);
   state.pending[pending.id] = pending;
