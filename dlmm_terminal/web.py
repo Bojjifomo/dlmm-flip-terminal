@@ -1,0 +1,948 @@
+"""DLMM terminal, web version: Meteora DLMM SOL pools with the spec v1 entry check,
+a detail panel with the chart, and your wallet's positions with the exit rules.
+
+  python3 -m dlmm_terminal web                 # http://localhost:8891 (DLMM_WEB_PORT in .env)
+  python3 -m dlmm_terminal web --port 8891 --host 0.0.0.0   # reachable over Tailscale
+
+Trading (like LP WEB): put the wallet's private key in .env as DLMM_PRIVATE_KEY (base58,
+as Phantom exports it). The key stays in the Node executor on this Mac; the browser only
+ever sees the address. Without a key the page is read-only.
+
+Who may trade:
+  * without DLMM_WEB_PIN: only a browser on this Mac (127.0.0.1)
+  * with DLMM_WEB_PIN set: any device that can reach the page (phone over Tailscale), with the PIN
+Trade requests must also carry the X-DLMM-Trade header, which another website open in your
+browser cannot add without a CORS preflight this server never answers.
+"""
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+from . import api, exits, filters, flip, node, settings
+
+HERE = Path(__file__).resolve().parent
+STATIC = HERE / "web"
+DEX = "https://api.dexscreener.com/latest/dex/pairs/solana/"
+POOL_TTL = 60          # seconds a pool scan is reused
+LOG_EVERY = 15 * 60    # candidates.jsonl gets a full snapshot at most this often
+
+_lock = threading.Lock()
+_cache: dict = {}
+_last_log = 0.0
+
+
+def _get_json(url: str, timeout: int = 15):
+    req = urllib.request.Request(url, headers={"User-Agent": "dlmm-terminal/1", "Accept": "application/json"})
+    with api.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def dex_market(ids: list[str]) -> dict:
+    """DexScreener per pool: price changes, buys/sells, volume pace. A failed batch only costs those columns."""
+    out = {}
+    for i in range(0, len(ids), 30):
+        try:
+            d = _get_json(DEX + ",".join(ids[i:i + 30]), timeout=10)
+        except Exception:
+            continue
+        for p in d.get("pairs") or []:
+            pc, tx, vol = p.get("priceChange") or {}, p.get("txns") or {}, p.get("volume") or {}
+            out[p.get("pairAddress")] = {
+                "chg": {"5m": pc.get("m5"), "1h": pc.get("h1"), "6h": pc.get("h6"), "24h": pc.get("h24")},
+                "buys24": (tx.get("h24") or {}).get("buys"), "sells24": (tx.get("h24") or {}).get("sells"),
+                "vol1h": vol.get("h1"), "vol24": vol.get("h24"),
+                "icon": (p.get("info") or {}).get("imageUrl"),
+            }
+    return out
+
+
+def verdict(c: dict, m: dict | None) -> dict:
+    """OPEN / CAREFUL / WAIT / SKIP from the spec gates and flags, plus reasons shown as ✓ / ✗.
+
+    SKIP  a gate that won't change (SOL not in pair, bin step outside 20-250)
+    WAIT  a gate that can change (pool too young, fee APR too low; size vs TVL only if configured)
+    CAREFUL  gates pass, some flag shows
+    OPEN  gates pass, no flags
+    Market signals (volume pace, buyers vs sellers) are context only: the spec found
+    no entry signal that held up on unseen tokens, so they never change the level.
+    """
+    hard = [g for g in c["gatesFailed"] if g.startswith(("solQuoted", "binStep"))]
+    level = "SKIP" if hard else "WAIT" if c["gatesFailed"] else "CAREFUL" if c["flags"] else "OPEN"
+    bad = [{"ok": False, "text": g} for g in c["gatesFailed"]] + [{"ok": False, "text": f, "flag": True} for f in c["flags"]]
+    good = []
+    if not c["gatesFailed"]:
+        good.append({"ok": True, "text": f"Gates pass: fee APR {c['feeApr24h']:,.0f}% · {c['sizeVsTvlPct']}% of TVL · {c['poolAgeHours']:.1f}h old"})
+    info = []
+    if m:
+        v1, v24 = m.get("vol1h") or 0, m.get("vol24") or 0
+        if v24 and v1 * 24 >= 1.5 * v24:
+            info.append({"ok": True, "text": f"Volume picking up: last hour runs {v1 * 24 / v24:.1f}x the 24h pace"})
+        elif v24 and v1 * 24 <= 0.4 * v24:
+            info.append({"ok": False, "text": f"Quiet: last hour runs {v1 * 24 / v24:.1f}x the 24h pace"})
+        b, s = m.get("buys24") or 0, m.get("sells24") or 0
+        if b + s >= 50:
+            share = b / (b + s) * 100
+            if share >= 55:
+                info.append({"ok": True, "text": f"Buyers lead: {share:.0f}% of 24h trades are buys"})
+            elif share <= 45:
+                info.append({"ok": False, "text": f"Sellers lead: {100 - share:.0f}% of 24h trades are sells"})
+    score = len(good) + sum(1 for x in info if x["ok"]) - len(bad) - sum(1 for x in info if not x["ok"])
+    return {"level": level, "score": score, "reasons": bad + good, "info": info}
+
+
+def _build_rows(snaps: list[dict], cfg: dict):
+    """Meteora pool snapshots -> table rows (spec v1 verdict, fees per window, DexScreener moves)."""
+    market = dex_market([p["address"] for p in snaps])
+    now = datetime.now(timezone.utc)
+    out = []
+    for snap in snaps:
+        m = market.get(snap["address"])
+        c = filters.evaluate(snap, [], cfg, now, changes=(m or {}).get("chg"))
+        v = verdict(c, m)
+        tvl = snap.get("tvl") or 0
+        fees, vol = snap.get("fees") or {}, snap.get("volume") or {}
+        out.append({
+            **{k: c[k] for k in ("pool", "name", "symbol", "tokenMint", "solSide", "poolAgeHours", "tvlUsd", "feeApr1h",
+                                 "feeApr24h", "volTvl24h", "mcapUsd", "priceChg1h", "priceChg6h", "priceChg24h", "binStep",
+                                 "baseFeePct", "sizeVsTvlPct", "holders", "priceSol", "gatesFailed", "flags", "plan", "solUsd")},
+            "vol24": vol.get("24h") or 0, "vol1h": vol.get("1h") or 0,
+            # fees per window, and the same as % of TVL per day at that window's pace
+            "fees": {w: fees.get(w) or 0 for w in ("1h", "4h", "24h")},
+            "feePctDay": {w: (fees.get(w) or 0) / tvl * 100 * 24 / h if tvl else 0 for w, h in (("1h", 1), ("4h", 4), ("24h", 24))},
+            "chg5m": ((m or {}).get("chg") or {}).get("5m"), "icon": (m or {}).get("icon"),
+            "priceUsd": filters.token_of(snap).get("price") if filters.sol_side(snap) else None,
+            "verdict": v,
+        })
+    return out, market, now
+
+
+def token_pools(cfg: dict, mint: str) -> dict:
+    """Every Meteora DLMM pool of one token against SOL, without the list's TVL / fee prefilter
+    (the list hides a token's quieter pools), deepest first. Cached two minutes."""
+    key = ("token", mint)
+    with _lock:
+        hit = _cache.get(key)
+        if hit and time.time() - hit["t"] < 120:
+            return hit["data"]
+    snaps, seen = [], set()
+    for f in (f"token_x={mint} && token_y={api.SOL_MINT}", f"token_x={api.SOL_MINT} && token_y={mint}"):
+        for r in api.list_pools(f"is_blacklisted=false && {f}", sort_by="tvl:desc", page=1, page_size=50):
+            if r["address"] not in seen:
+                seen.add(r["address"])
+                snaps.append(r)
+    rows, _, _ = _build_rows(snaps, cfg) if snaps else ([], None, None)
+    rows.sort(key=lambda r: -(r.get("tvlUsd") or 0))
+    # The token's pools on other venues (pump.fun / PumpSwap / Raydium / DAMM): context only, the terminal LPs on DLMM.
+    other = []
+    try:
+        for p in _get_json("https://api.dexscreener.com/token-pairs/v1/solana/" + mint, timeout=10) or []:
+            if p.get("pairAddress") in seen:
+                continue
+            liq = (p.get("liquidity") or {}).get("usd") or 0
+            other.append({"pair": p.get("pairAddress"), "dex": p.get("dexId"), "labels": p.get("labels") or [],
+                          "quote": (p.get("quoteToken") or {}).get("symbol"), "liqUsd": liq,
+                          "vol24": (p.get("volume") or {}).get("h24") or 0, "url": p.get("url")})
+    except Exception:
+        pass
+    other = sorted([o for o in other if o["liqUsd"] >= 100 or o["vol24"] >= 100], key=lambda o: -o["liqUsd"])[:8]
+    data = {"t": time.time(), "mint": mint, "rows": rows, "other": other}
+    with _lock:
+        _cache[key] = {"t": time.time(), "data": data}
+    return data
+
+
+def pool_rows(cfg: dict, min_tvl: float, force: bool = False) -> dict:
+    global _last_log
+    key = ("pools", min_tvl)
+    with _lock:
+        hit = _cache.get(key)
+        if hit and not force and time.time() - hit["t"] < POOL_TTL:
+            return hit["data"]
+    s = cfg["scan"]
+    min_ratio = cfg["gates"]["minFeeApr24hPct"] / 365 / 4   # wide prefilter: WAIT rows are worth seeing too
+    base = f"is_blacklisted=false && tvl>={max(min_tvl, s['prefilterMinTvlUsd'])} && fee_tvl_ratio_24h>={min_ratio:.4f}"
+    snaps, seen = [], set()
+    for side in ("token_y", "token_x"):
+        for page in range(1, s["pages"] + 1):
+            rows = api.list_pools(f"{base} && {side}={api.SOL_MINT}", page=page, page_size=s["pageSize"])
+            for r in rows:
+                if r["address"] not in seen:
+                    seen.add(r["address"])
+                    snaps.append(r)
+            if len(rows) < s["pageSize"]:
+                break
+    out, market, now = _build_rows(snaps, cfg)
+    data = {"t": time.time(), "rows": out, "solUsd": next((r["solUsd"] for r in out if r["solUsd"]), None),
+            "maxPositionSol": filters.max_position_sol(cfg), "sizeSol": filters.planned_size_sol(cfg)}
+    with _lock:
+        _cache[key] = {"t": time.time(), "data": data}
+    if time.time() - _last_log >= LOG_EVERY:   # spec section 5: log every candidate, skipped ones too
+        _last_log = time.time()
+        from .cli import append
+        for snap in snaps:
+            m = market.get(snap["address"])
+            c = filters.evaluate(snap, [], cfg, now, changes=(m or {}).get("chg"))
+            c["source"] = "web"
+            append("candidates.jsonl", c)
+    return data
+
+
+# ---------- PING: the signal filter (v1 gates + GMGN bands - dead→alive), top N ----------
+_ping = {"t": 0.0, "running": False, "data": None, "error": None, "cfgKey": None}
+PING_TTL = 5 * 60
+
+
+def _ping_key(cfg: dict) -> str:
+    keep = {k: cfg.get(k) for k in ("universe", "gates", "signal", "scan")}
+    return json.dumps(keep, sort_keys=True, default=str)
+
+
+def _benchmark_profile() -> dict:
+    """data/benchmark.json if the signal command built one; the filter itself only needs the owner's bands."""
+    from .cli import DATA
+    try:
+        return json.loads((DATA / "benchmark.json").read_text())
+    except (OSError, ValueError):
+        return {"wallet": "", "days": 0, "bands": {}, "binSteps": {}}
+
+
+def _ping_run(cfg: dict) -> None:
+    from . import blast
+    from .cli import scan_hits
+    try:
+        now = time.time()
+        prof = _benchmark_profile()
+        state = {"lastLog": now}                      # the signal command logs candidates; the web doesn't
+        hits = scan_hits(cfg, prof, state, now)
+        dx = blast.dex_5m([c["pool"] for c, _, _ in hits])
+        rows = [blast.row(c, snap, m, dx.get(c["pool"]), now) for c, m, snap in hits]
+        sig = cfg["signal"]
+        best = blast.top(rows, int(sig.get("blastTop", 10)), sig.get("blastSortBy", "volTvl1h"))
+        for i, r in enumerate(best, 1):
+            r["rank"] = i
+            r.pop("hours", None)
+        revived = state.get("revivedExcluded") or []
+        prev = {r["pool"] for r in ((_ping.get("data") or {}).get("rows") or [])}
+        data = {"t": now, "rows": best, "total": len(rows), "revived": [{"pool": x["pool"], "symbol": x["symbol"]} for x in revived],
+                "filter": blast.filter_text(cfg, prof, len(best), len(rows), len(revived)),
+                "new": [r["pool"] for r in best if prev and r["pool"] not in prev]}
+        with _lock:
+            _ping.update(t=now, data=data, error=None, cfgKey=_ping_key(cfg))
+    except Exception as exc:
+        with _lock:
+            _ping.update(t=time.time(), error=str(exc)[:300])
+    finally:
+        with _lock:
+            _ping["running"] = False
+
+
+def ping_rows(cfg: dict, force: bool = False) -> dict:
+    """Cached PING list; a stale or forced one is rebuilt in the background (it takes 20-60 s:
+    one DexScreener request per token that passes the gates, one history request per hit)."""
+    with _lock:
+        stale = force or time.time() - _ping["t"] > PING_TTL or _ping["cfgKey"] not in (None, _ping_key(cfg))
+        if stale and not _ping["running"]:
+            _ping["running"] = True
+            threading.Thread(target=_ping_run, args=(cfg,), daemon=True).start()
+        return {"running": _ping["running"], "error": _ping["error"], **(_ping["data"] or {"rows": [], "t": 0})}
+
+
+# ---------- view prefs shared by every browser (Mac + phone) ----------
+PREF_KEYS = {"unit", "mode", "win", "sort", "tvl", "filters", "view"}
+
+
+def _prefs_file():
+    from .cli import DATA
+    return DATA / "ui_prefs.json"
+
+
+def prefs_load() -> dict:
+    try:
+        return json.loads(_prefs_file().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def prefs_set(changes: dict) -> dict:
+    p = prefs_load()
+    p.update({k: v for k, v in changes.items() if k in PREF_KEYS and len(json.dumps(v)) < 200})
+    f = _prefs_file()
+    f.parent.mkdir(exist_ok=True)
+    f.write_text(json.dumps(p))
+    return p
+
+
+# ---------- watchlist: the pools you picked to play ----------
+def _watch_file():
+    from .cli import DATA
+    return DATA / "watchlist.json"
+
+
+def watchlist() -> list[dict]:
+    try:
+        return json.loads(_watch_file().read_text())
+    except (OSError, ValueError):
+        return []
+
+
+def watch_set(pool: str, symbol: str, on: bool, note: str | None = None) -> list[dict]:
+    cur = [w for w in watchlist() if w.get("pool") != pool]
+    if on:
+        cur.append({"pool": pool, "symbol": symbol, "addedAt": time.time(), **({"note": note} if note else {})})
+    f = _watch_file()
+    f.parent.mkdir(exist_ok=True)
+    f.write_text(json.dumps(cur, indent=1))
+    return cur
+
+
+KEEP_MINTS = {"So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+              "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}
+
+
+def _rpc(method: str, params: list):
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+    req = urllib.request.Request(node.PUBLIC_RPC, data=body, headers={"Content-Type": "application/json", "User-Agent": "dlmm-terminal/1"})
+    with api.urlopen(req, timeout=15) as r:
+        return json.load(r)["result"]
+
+
+def leftovers(wallet: str) -> dict:
+    """Tokens in the wallet that are not SOL / USDC / USDT (what a close left behind), with their
+    value from DexScreener, biggest first. Read on the public node: no Helius quota."""
+    held: dict = {}
+    for prog in ("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"):
+        res = _rpc("getTokenAccountsByOwner", [wallet, {"programId": prog}, {"encoding": "jsonParsed", "commitment": "confirmed"}])
+        for a in res.get("value") or []:
+            info = a["account"]["data"]["parsed"]["info"]
+            amt = info["tokenAmount"]
+            if info["mint"] in KEEP_MINTS or int(amt["amount"]) == 0:
+                continue
+            h = held.setdefault(info["mint"], {"mint": info["mint"], "raw": 0, "ui": 0.0, "decimals": amt["decimals"]})
+            h["raw"] += int(amt["amount"])
+            h["ui"] += float(amt.get("uiAmount") or 0)
+    mints = list(held)
+    for i in range(0, len(mints), 30):
+        try:
+            for p in _get_json("https://api.dexscreener.com/tokens/v1/solana/" + ",".join(mints[i:i + 30]), timeout=10) or []:
+                t = held.get((p.get("baseToken") or {}).get("address"))
+                liq = (p.get("liquidity") or {}).get("usd") or 0
+                if t is not None and liq >= t.get("_liq", -1):
+                    t.update(symbol=(p.get("baseToken") or {}).get("symbol"), priceUsd=float(p.get("priceUsd") or 0), _liq=liq)
+        except Exception:
+            pass
+    rows = []
+    for t in held.values():
+        t.pop("_liq", None)
+        t["valueUsd"] = t["ui"] * t["priceUsd"] if t.get("priceUsd") else None
+        rows.append(t)
+    rows.sort(key=lambda t: -(t["valueUsd"] or 0))
+    priced = [t for t in rows if t["valueUsd"] is not None]
+    total = {"count": len(rows), "valueUsd": sum(t["valueUsd"] for t in priced),
+             "dust": sum(1 for t in priced if t["valueUsd"] < 0.10), "unpriced": len(rows) - len(priced),
+             "worth": sum(1 for t in priced if t["valueUsd"] >= 0.10)}
+    return {"wallet": wallet, "rows": rows, "total": total, "sales": recent_sales()}
+
+
+def recent_sales(n: int = 8) -> list[dict]:
+    from .cli import DATA
+    try:
+        lines = (DATA / "swaps.jsonl").read_text().splitlines()[-n:]
+        return [json.loads(l) for l in reversed(lines)]
+    except (OSError, ValueError):
+        return []
+
+
+def wallet_sol(wallet: str) -> float | None:
+    """SOL balance on the public node (reads never spend the Helius quota)."""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [wallet, {"commitment": "confirmed"}]}).encode()
+    req = urllib.request.Request(node.PUBLIC_RPC, data=body, headers={"Content-Type": "application/json", "User-Agent": "dlmm-terminal/1"})
+    try:
+        with api.urlopen(req, timeout=10) as r:
+            return json.load(r)["result"]["value"] / 1e9
+    except Exception:
+        return None
+
+
+# ---------- auto exit (take profit per ladder, you switch it on per position) ----------
+# data/auto_exit.json: {pool: {"pct": 5, "symbol", "armedAt", "status": armed|firing|done|failed, "msg", "pnlPct"}}
+# While the web server runs, a thread checks the armed ladders every web.autoExitCheckMin minutes
+# (Meteora's data API only, no RPC). When the ladder's PnL % (PnL SOL / deposit, the number on the
+# row) reaches the target, it closes every slice of that pool and sells the token to SOL (reenter.mjs
+# without --reopen, the Close+swap button). Spec v1 found fixed take-profits lost SOL vs. manual
+# exits; this is off until you arm it.
+_auto_lock = threading.Lock()
+TP_CHOICES = (3, 5, 10)
+
+
+def _auto_file():
+    from .cli import DATA
+    return DATA / "auto_exit.json"
+
+
+def auto_load() -> dict:
+    try:
+        return json.loads(_auto_file().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def auto_save(d: dict) -> None:
+    f = _auto_file()
+    f.parent.mkdir(exist_ok=True)
+    f.write_text(json.dumps(d, indent=1))
+
+
+def auto_set(pool: str, symbol: str, pct: float | None) -> dict:
+    with _auto_lock:
+        d = auto_load()
+        if not pct:
+            d.pop(pool, None)
+        else:
+            d[pool] = {"pct": float(pct), "symbol": symbol, "armedAt": time.time(), "status": "armed"}
+        auto_save(d)
+        return d
+
+
+def _ladders(wallet: str) -> dict:
+    """{pool: {"symbol", "positions": [...], "pnlSol", "depositSol", "pnlPct"}} from Meteora's data API."""
+    from .cli import ticks_for_wallet
+    meta = {p["poolAddress"]: p for p in api.open_portfolio(wallet)}
+    out: dict = {}
+    for t in ticks_for_wallet(wallet, time.time()):
+        g = out.setdefault(t.pool, {"symbol": t.symbol, "positions": []})
+        g["positions"].append(t.position)
+    for pool, g in out.items():
+        m = meta.get(pool, {})
+        pnl, dep = float(m.get("pnlSol") or 0), float(m.get("totalDepositSol") or 0)
+        mint = m.get("tokenXMint") if m.get("tokenYMint") == api.SOL_MINT else m.get("tokenYMint")
+        g.update(pnlSol=pnl, depositSol=dep, pnlPct=pnl / dep * 100 if dep else None, mint=mint)
+    return out
+
+
+SELL_TRIES = 6
+
+
+def _retry_sells(cfg: dict) -> None:
+    """A ladder the auto exit closed but whose token did not sell (route refused, rate limit): try the
+    sale again on every check, up to SELL_TRIES times, then leave it for Cleanup."""
+    from .cli import append, notify
+    with _auto_lock:
+        todo = {k: v for k, v in auto_load().items() if v.get("status") == "selling" and v.get("leftover")}
+    for pool, a in todo.items():
+        left = a["leftover"]
+        res = node.run("sell.mjs", ["--mint", left["mint"], "--pool", left.get("pool") or pool,
+                                    "--maxloss", str(cfg["trade"]["maxLossPct"])], timeout=300)
+        if res.get("busy"):                                  # another sale of this token is running: next check
+            continue
+        tries = int(a.get("sellTries") or 0) + 1
+        ok = bool(res.get("ok"))
+        with _auto_lock:
+            d = auto_load()
+            if pool not in d:
+                continue
+            if ok:
+                got = f"◎{res.get('sol', 0):.4f} via {res.get('via')}" if res.get("signature") else "udah nggak ada di wallet"
+                d[pool].update(status="done", msg=f"closed · token dijual {got} (percobaan {tries})", sellTries=tries)
+            elif tries >= SELL_TRIES:
+                d[pool].update(status="failed", msg=f"closed, token gagal dijual {tries}x: {(res.get('error') or '')[:120]}. Pakai Cleanup.", sellTries=tries)
+            else:
+                d[pool].update(sellTries=tries, msg=f"closed, token belum kejual (coba {tries}/{SELL_TRIES}): {(res.get('error') or '')[:100]}")
+            auto_save(d)
+            status = d[pool]["status"]
+        if status != "selling":
+            append("closes.jsonl", {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "source": "auto-exit-sell",
+                                    "pool": pool, "symbol": a.get("symbol"), "mint": left["mint"], "tries": tries,
+                                    **{k: res.get(k) for k in ("ok", "error", "via", "sol", "signature")}})
+            notify(f"{'✅' if ok else '❌'} AUTO EXIT {a.get('symbol')}: {d[pool]['msg']}")
+
+
+def auto_exit_once(cfg: dict, wallet: str) -> list[dict]:
+    """One pass: fire every armed ladder at or over its target. Returns what fired."""
+    from .cli import append, notify
+    _retry_sells(cfg)
+    with _auto_lock:
+        armed = {k: v for k, v in auto_load().items() if v.get("status") == "armed"}
+    if not armed:
+        return []
+    ladders = _ladders(wallet)
+    fired = []
+    for pool, a in armed.items():
+        g = ladders.get(pool)
+        with _auto_lock:
+            d = auto_load()
+            if pool not in d:
+                continue
+            if not g:                                        # closed some other way (monitor --mode auto, by hand)
+                mint = d[pool].get("mint")
+                if mint and _holds(wallet, mint):
+                    # the close left the token in the wallet: the auto exit was armed to end in SOL, so sell it
+                    d[pool].update(status="selling", leftover={"mint": mint, "pool": pool}, sellTries=0, firedAt=time.time(),
+                                   msg="posisi udah ditutup di tempat lain; token sisanya dijual")
+                else:
+                    d[pool].update(status="done", firedAt=time.time(), msg="posisi udah ditutup di tempat lain (nggak ada token sisa)")
+                auto_save(d)
+                continue
+            d[pool]["pnlPct"] = g["pnlPct"]
+            if g.get("mint"):
+                d[pool]["mint"] = g["mint"]
+            d[pool]["checkedAt"] = time.time()
+            hit = g["pnlPct"] is not None and g["pnlPct"] >= a["pct"]
+            if hit:
+                d[pool]["status"] = "firing"
+            auto_save(d)
+        if not hit:
+            continue
+        notify(f"🎯 AUTO EXIT {g['symbol']}: PnL {g['pnlPct']:+.2f}% ≥ +{a['pct']:g}% → close + swap {len(g['positions'])} slice")
+        res = node.run("reenter.mjs", ["--pool", pool, "--positions", ",".join(g["positions"]),
+                                       "--maxloss", str(cfg["trade"]["maxLossPct"])], timeout=900)
+        ok = bool(res.get("ok"))
+        sw = res.get("swap") or {}
+        left = res.get("leftover")
+        if ok:
+            sold = f" · token dijual ◎{sw.get('sol', 0):.4f} via {sw.get('via')}" if sw.get("signature") else " · nggak ada token buat dijual"
+            msg = f"closed, ◎{res.get('solBack', 0):.4f} balik{sold}"
+        elif left:
+            msg = f"closed, token belum kejual ({(res.get('error') or '')[:120]}): dicoba jual lagi tiap cek"
+        else:
+            msg = f"{res.get('step') or ''} {res.get('error') or 'gagal'}"
+        msg = msg[:220]
+        with _auto_lock:
+            d = auto_load()
+            if pool in d:
+                d[pool].update(status="done" if ok else "selling" if left else "failed", msg=msg, firedAt=time.time(),
+                               pnlPct=g["pnlPct"], **({"leftover": left, "sellTries": 0} if left else {}))
+                auto_save(d)
+        append("closes.jsonl", {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "source": "auto-exit", "pool": pool,
+                                "symbol": g["symbol"], "positions": g["positions"], "rule": f"takeProfit {a['pct']:g}%",
+                                "pnlPct": g["pnlPct"], **{k: res.get(k) for k in ("ok", "error", "step", "solBack")}})
+        notify(f"{'✅' if ok else '❌'} AUTO EXIT {g['symbol']}: {msg}")
+        fired.append({"pool": pool, "ok": ok, "msg": msg})
+    return fired
+
+
+def _holds(wallet: str, mint: str) -> bool:
+    """Does the wallet hold any of `mint`? (public node, no Helius quota). Unknown counts as yes: the sale itself
+    reads the balance and says "nothing held" when there is none."""
+    try:
+        res = _rpc("getTokenAccountsByOwner", [wallet, {"mint": mint}, {"encoding": "jsonParsed", "commitment": "confirmed"}])
+        return any(int(a["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]) > 0 for a in res.get("value") or [])
+    except Exception:
+        return True
+
+
+# ---------- bid-ask flip (per pool: off / alert / auto) ----------
+# data/flip.json: {"pools": {pool: {"mode", "symbol", "armedAt"}},
+#                  "positions": {position: {"pool", "side", "crossed_since", "checks", "msg", "ready", "to", "error"}},
+#                  "history": [{"pool", "symbol", "at", "position", "from", "to", "ok", "newPosition", "msg"}]}
+# Checked on the same clock as the auto exit (web.autoExitCheckMin), from Meteora's data API (no RPC); flip.mjs looks
+# at the position on chain again before it sends anything. While a pool is armed, the exit rules that would close a
+# bid that the price ran through (closeBelowRangeAfterMin, priceStopBelowEntryPct) leave it alone: the flip handles it.
+def _flip_file():
+    from .cli import DATA
+    return DATA / "flip.json"
+
+
+def flip_load() -> dict:
+    return flip.load(_flip_file())
+
+
+def flip_save(d: dict) -> None:
+    f = _flip_file()
+    f.parent.mkdir(exist_ok=True)
+    f.write_text(json.dumps(d, indent=1))
+
+
+def flip_set(pool: str, symbol: str, mode: str) -> dict:
+    with _auto_lock:
+        d = flip_load()
+        if mode == "off":
+            d["pools"].pop(pool, None)
+        else:
+            d["pools"][pool] = {"mode": mode, "symbol": symbol, "armedAt": time.time()}
+        flip_save(d)
+        return d
+
+
+def flip_cfg(cfg: dict) -> dict:
+    return {**flip.DEFAULTS, **(cfg.get("flip") or {})}
+
+
+def flip_run(cfg: dict, pool: str, position: str, to: str, symbol: str = "", force: bool = False, source: str = "auto") -> dict:
+    """Send one flip (flip.mjs) and record it."""
+    from .cli import append, notify
+    fc = flip_cfg(cfg)
+    args = ["--pool", pool, "--position", position, "--to", to, "--gap", str(int(fc["gapBins"])),
+            "--slippage", str(float(fc["slippagePct"])), "--reserve", str(float(fc["minSolReserve"]))]
+    if force:
+        args.append("--force")
+    res = node.run("flip.mjs", args, timeout=600)
+    ok = bool(res.get("ok"))
+    with _auto_lock:
+        d = flip_load()
+        st = d["positions"].get(position, {})
+        if ok:
+            d["positions"].pop(position, None)
+            d["positions"][res["newPosition"]] = {"pool": pool, "side": to, "fresh": time.time(),
+                                                  "msg": f"dibuka dari flip {st.get('side') or '?'} → {to}"}
+            msg = f"{st.get('side') or ('bid' if to == 'ask' else 'ask')} → {to}: posisi baru {res['newPosition'][:6]}… · bin {res['range']['lo']}..{res['range']['hi']}"
+        elif res.get("notReady"):
+            msg = res.get("error") or "belum nembus on chain"
+            if position in d["positions"]:
+                d["positions"][position].update(ready=False, msg=msg)
+        else:
+            msg = (res.get("error") or "gagal")[:220]
+            if position in d["positions"]:
+                d["positions"][position].update(error=msg, errorAt=time.time(), ready=False)
+        if not res.get("notReady"):
+            d["history"] = (d.get("history") or [])[-199:] + [{"pool": pool, "symbol": symbol, "at": time.time(), "position": position,
+                                                              "to": to, "ok": ok, "newPosition": res.get("newPosition"), "msg": msg, "source": source}]
+        flip_save(d)
+    if not res.get("notReady"):
+        append("flips.jsonl", {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "source": source, "pool": pool,
+                               "symbol": symbol, "position": position, "to": to,
+                               **{k: res.get(k) for k in ("ok", "error", "step", "newPosition", "range", "depositSol", "depositToken", "signatures")}})
+        notify(f"{'🔁' if ok else '❌'} FLIP {symbol or pool[:6]}: {msg}")
+    return res
+
+
+def flip_once(cfg: dict, wallet: str) -> list[dict]:
+    """One pass over the armed pools: update every position's flip state, send the flips that are due (auto) or
+    say they are ready (alert)."""
+    from .cli import notify, ticks_for_wallet
+    with _auto_lock:
+        armed = dict(flip_load()["pools"])
+    if not armed:
+        return []
+    fc, now = flip_cfg(cfg), time.time()
+    due, seen = [], set()
+    ticks = [t for t in ticks_for_wallet(wallet, now) if t.pool in armed]
+    with _auto_lock:
+        d = flip_load()
+        for t in ticks:
+            seen.add(t.position)
+            raw = d["positions"].get(t.position) or {"pool": t.pool}
+            st = flip.FlipState.from_dict(raw)
+            dec = flip.evaluate(now, t.price, t.range_min, t.range_max, t.sol_only, st, fc, flip.flips_24h(d, t.pool, now))
+            raw.update(st.to_dict(), pool=t.pool, msg=dec.msg, ready=dec.kind == "flip", to=dec.to)
+            if dec.kind == "wait":
+                raw.pop("error", None)
+                raw.pop("errorAt", None)
+            d["positions"][t.position] = raw
+            if dec.kind == "flip":
+                mode = armed[t.pool]["mode"]
+                if mode == "auto":
+                    if now - float(raw.get("errorAt") or 0) >= 600:      # a failed flip waits 10 min before the next try
+                        due.append((t, dec))
+                elif not st.notified:
+                    raw["notified"] = True
+                    notify(f"🔁 FLIP SIAP {t.symbol} {t.position[:6]}…: {dec.msg}. Klik Flip di Portfolio (mode alert).")
+        # forget positions of armed pools that are gone (closed / flipped)
+        # (a position a flip just opened is kept 30 min: Meteora's API lists it a few minutes late)
+        for pos in [p for p, v in d["positions"].items() if v.get("pool") in armed and p not in seen
+                    and not (v.get("fresh") and now - v["fresh"] < 1800)]:
+            d["positions"].pop(pos)
+        flip_save(d)
+    done = []
+    for t, dec in due:
+        res = flip_run(cfg, t.pool, t.position, dec.to, t.symbol, source="auto")
+        done.append({"pool": t.pool, "position": t.position, "to": dec.to, "ok": bool(res.get("ok"))})
+    return done
+
+
+def _auto_loop(cfg: dict) -> None:
+    import sys
+    while True:
+        try:
+            tw = node.trade_wallet()
+            if tw.get("ok") and auto_load():
+                auto_exit_once(cfg, tw["pubkey"])
+            if tw.get("ok") and flip_load()["pools"]:
+                flip_once(cfg, tw["pubkey"])
+        except Exception as exc:
+            print(f"[auto-exit] {exc}", file=sys.stderr, flush=True)
+        time.sleep(max(1, float((cfg.get("web") or {}).get("autoExitCheckMin", 2))) * 60)
+
+
+def portfolio(wallet: str, cfg: dict) -> dict:
+    from .cli import DATA, ticks_for_wallet
+    now = time.time()
+    state_file = DATA / "web_monitor_state.json"
+    try:
+        states = json.loads(state_file.read_text())
+    except Exception:
+        states = {}
+    meta = {p["poolAddress"]: p for p in api.open_portfolio(wallet)}
+    fl = flip_load()
+    rows, seen = [], set()
+    for t in ticks_for_wallet(wallet, now):
+        seen.add(t.position)
+        st = exits.State.from_dict(states.get(t.position))
+        ev = exits.evaluate(t, st, flip.exits_for(cfg["exits"], t.pool in fl["pools"]))
+        states[t.position] = st.to_dict()
+        p = meta.get(t.pool, {})
+        rows.append({
+            "position": t.position, "pool": t.pool, "symbol": t.symbol, "pnlPct": t.pnl_pct, "pnlSol": t.pnl_sol,
+            "peakPnlPct": st.peak_pnl, "solOnly": t.sol_only,
+            "priceVsTopPct": (t.price / t.range_max - 1) * 100 if t.range_max else None,
+            "rangeBottomPct": (t.range_min / t.range_max - 1) * 100 if t.range_max else None,
+            "inRange": t.range_min <= t.price <= t.range_max, "below": t.price < t.range_min,
+            "heldMin": (now - t.created_at) / 60 if t.created_at else None,
+            "events": ev, "binStep": p.get("binStep"),
+            "poolBalancesSol": p.get("balancesSol"), "poolUnclaimedSol": p.get("unclaimedFeesSol"),
+            "poolPnlSol": p.get("pnlSol"), "poolDepositSol": p.get("totalDepositSol"),
+            "poolPnlPct": p.get("pnlSolPctChange") if p.get("pnlSolPctChange") is not None else p.get("pnlPctChange"),
+            "rangeMax": t.range_max, "rangeMin": t.range_min, "price": t.price,
+        })
+    for gone in set(states) - seen:
+        states.pop(gone)
+    DATA.mkdir(exist_ok=True)
+    state_file.write_text(json.dumps(states))
+    pools = list(meta.values())
+    f = lambda k: sum(float(p.get(k) or 0) for p in pools)
+    return {"wallet": wallet, "t": now, "rows": rows, "valueSol": f("balancesSol"), "unclaimedSol": f("unclaimedFeesSol"),
+            "pnlSol": f("pnlSol"), "depositSol": f("totalDepositSol"), "exitsCfg": cfg["exits"],
+            "walletSol": wallet_sol(wallet), "autoExit": auto_load(), "tpChoices": TP_CHOICES,
+            "flip": {"pools": fl["pools"], "positions": fl["positions"], "history": (fl.get("history") or [])[-20:], "cfg": flip_cfg(cfg)},
+            "autoExitCheckMin": (cfg.get("web") or {}).get("autoExitCheckMin", 2)}
+
+
+class Handler(BaseHTTPRequestHandler):
+    cfg: dict = {}
+
+    def log_message(self, fmt, *a):  # quiet
+        pass
+
+    def _send(self, code: int, body: bytes, ctype: str):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj, default=str).encode(), "application/json")
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+        try:
+            if u.path == "/api/pools":
+                return self._json(pool_rows(self.cfg, float(q.get("tvl", 2000)), q.get("force") == "1"))
+            if u.path == "/api/leftovers":
+                wallet = q.get("wallet") or (node.trade_wallet().get("pubkey"))
+                if not wallet:
+                    return self._json({"error": "no wallet"}, 400)
+                return self._json(leftovers(wallet))
+            if u.path == "/api/token_pools":
+                return self._json(token_pools(self.cfg, q["mint"]))
+            if u.path == "/api/pool":
+                return self._json(api.pool(q["address"]))
+            if u.path == "/api/portfolio":
+                wallet = q.get("wallet") or os.environ.get("DLMM_WALLET")
+                if not wallet:
+                    return self._json({"error": "no wallet: pass ?wallet= or set DLMM_WALLET"}, 400)
+                return self._json(portfolio(wallet, self.cfg))
+            if u.path == "/api/ping":
+                return self._json(ping_rows(self.cfg, q.get("force") == "1"))
+            if u.path == "/api/prefs":
+                return self._json(prefs_load())
+            if u.path == "/api/watchlist":
+                return self._json({"rows": watchlist()})
+            if u.path == "/api/settings":
+                return self._json({"form": settings.form(self.cfg, self.base_cfg()), "overlay": settings.load()})
+            if u.path == "/api/config":
+                from .cli import env_report, load_env
+                load_env(reload=True)                      # a key pasted into .env works without a restart
+                tw = node.trade_wallet() if not node.ready() else {"ok": False}
+                return self._json({"cfg": self.cfg, "wallet": tw.get("pubkey") or os.environ.get("DLMM_WALLET"),
+                                   "maxPositionSol": filters.max_position_sol(self.cfg), "executor": node.ready(),
+                                   "trade": {"enabled": bool(tw.get("ok")), "wallet": tw.get("pubkey"),
+                                             "error": None if tw.get("ok") or not node.key_configured() else tw.get("error"),
+                                             "pin": bool(os.environ.get("DLMM_WEB_PIN")), "local": self._is_local(),
+                                             "envCheck": None if tw.get("ok") or not self._is_local() else env_report()}})
+        except Exception as exc:
+            import sys
+            import traceback
+            print(f"[{datetime.now():%H:%M:%S}] {u.path} failed: {exc}", file=sys.stderr, flush=True)
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                print("  → SSL: jalanin `python3 -m pip install certifi` (atau 'Install Certificates.command' di folder Python), lalu start ulang.", file=sys.stderr)
+            else:
+                traceback.print_exc()
+            return self._json({"error": str(exc)[:300]}, 502)
+        name = "index.html" if u.path in ("/", "") else u.path.lstrip("/")
+        f = (STATIC / name).resolve()
+        if STATIC not in f.parents or not f.is_file():
+            return self._send(404, b"not found", "text/plain")
+        ctype = {".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png"}.get(f.suffix, "application/octet-stream")
+        self._send(200, f.read_bytes(), ctype)
+
+    config_path = None
+
+    def base_cfg(self) -> dict:
+        from .cli import load_config
+        return load_config(self.config_path, overlay=False)
+
+    def reload_cfg(self) -> None:
+        """Settings changed: the same cfg object (every request holds it) gets the new values; caches drop."""
+        from .cli import load_config
+        new = load_config(self.config_path)
+        self.cfg.clear()
+        self.cfg.update(new)
+        with _lock:
+            _cache.clear()
+
+    def _is_local(self) -> bool:
+        return self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+    def _trade_refused(self, body: dict) -> str | None:
+        """None when this request may move money, else why not."""
+        import hmac
+        if self.headers.get("X-DLMM-Trade") != "1" or "application/json" not in (self.headers.get("Content-Type") or ""):
+            return "missing trade header"
+        pin = os.environ.get("DLMM_WEB_PIN")
+        if pin:
+            return None if hmac.compare_digest(str(body.get("pin") or ""), pin) else "PIN salah"
+        return None if self._is_local() else "trading cuma dari Mac ini (set DLMM_WEB_PIN di .env buat dari HP)"
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        try:
+            if self.path in ("/api/trade/open", "/api/trade/close", "/api/trade/reenter", "/api/trade/cleanup", "/api/trade/sell", "/api/trade/flip"):
+                why = self._trade_refused(body)
+                if why:
+                    return self._json({"ok": False, "error": why}, 403)
+                if not node.trade_wallet().get("ok"):
+                    return self._json({"ok": False, "error": "belum ada key: isi DLMM_PRIVATE_KEY di .env lalu start ulang"}, 400)
+                from .cli import append
+                ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                if self.path.endswith("open"):
+                    pos = self.cfg["position"]
+                    retry = body.get("retrySlices")
+                    sol = float(body.get("sol") or 0.01) if retry else float(body["sol"])
+                    args = node.ladder_args(str(body["pool"]), sol, int(body.get("slices") or pos.get("ladderSlices", 5)),
+                                            abs(float(body.get("bottom") or pos["rangeBottomPct"])), float(body.get("top") or 0),
+                                            str(body.get("strategy") or "spot"))
+                    if retry:
+                        # open exactly the slices an earlier run did not manage, at their old bin ranges
+                        args += ["--retry-slices", json.dumps([{"lo": int(x["lo"]), "hi": int(x["hi"]), "lamports": str(int(x["lamports"]))} for x in retry])]
+                    res = node.run("open_ladder.mjs", args, timeout=900)
+                    from .cli import DATA
+                    append("opens.jsonl", {"ts": ts, "pool": body.get("pool"), "symbol": body.get("symbol"), "retry": bool(retry),
+                                           "ok": res.get("ok"), "error": res.get("error"), "results": res.get("results"),
+                                           "failedSlices": res.get("failedSlices")})
+                    append("decisions.jsonl", {"ts": ts, "source": "web", "pool": body.get("pool"), "symbol": body.get("symbol"),
+                                               "decision": "enter", "sizeSol": sol, "override": bool(body.get("override")),
+                                               "positions": [r.get("position") for r in res.get("results", [])], "ok": res.get("ok"),
+                                               "error": res.get("error")})
+                    return self._json(res)
+                if self.path.endswith("/flip"):
+                    to = str(body["to"])
+                    if to not in ("ask", "bid"):
+                        return self._json({"ok": False, "error": "to: ask | bid"}, 400)
+                    return self._json(flip_run(self.cfg, str(body["pool"]), str(body["position"]), to, str(body.get("symbol") or ""),
+                                               force=bool(body.get("force")), source="web"))
+                if self.path.endswith("/sell"):
+                    args = ["--mint", str(body["mint"]), "--maxloss", str(float(body.get("maxloss") or self.cfg["trade"]["maxLossPct"]))]
+                    if body.get("pool"):
+                        args += ["--pool", str(body["pool"])]
+                    res = node.run("sell.mjs", args, timeout=300)
+                    append("closes.jsonl", {"ts": ts, "source": "web", "rule": "sell", "mint": body.get("mint"),
+                                            **{k: res.get(k) for k in ("ok", "error", "via", "sol", "signature")}})
+                    return self._json(res)
+                if self.path.endswith("cleanup"):
+                    res = node.run("cleanup.mjs", ["--maxloss", str(float(body.get("maxloss") or self.cfg["trade"]["maxLossPct"]))], timeout=600)
+                    append("closes.jsonl", {"ts": ts, "source": "web", "rule": "cleanup", **{k: res.get(k) for k in ("ok", "error", "emptyAccounts", "closed", "left")}})
+                    return self._json(res)
+                if self.path.endswith("reenter"):
+                    pos = self.cfg["position"]
+                    positions = [str(x) for x in body["positions"]]
+                    args = ["--pool", str(body["pool"]), "--positions", ",".join(positions), "--maxloss", str(float(body.get("maxloss") or self.cfg["trade"]["maxLossPct"]))]
+                    if body.get("reopen"):
+                        args += ["--reopen", "--slices", str(int(body.get("slices") or len(positions) or pos.get("ladderSlices", 5))),
+                                 "--bottom", str(abs(float(body.get("bottom") or pos["rangeBottomPct"]))), "--top", str(float(body.get("top") or 0)),
+                                 "--strategy", str(body.get("strategy") or "spot")]
+                    res = node.run("reenter.mjs", args, timeout=900)
+                    append("closes.jsonl", {"ts": ts, "source": "web", "pool": body.get("pool"), "symbol": body.get("symbol"),
+                                            "positions": positions, "rule": "reenter" if body.get("reopen") else "close-swap", **{k: res.get(k) for k in ("ok", "error", "step", "solBack", "reopenSol")}})
+                    return self._json(res)
+                res = node.run("close_position.mjs", ["--pool", str(body["pool"]), "--position", str(body["position"])], timeout=300)
+                append("closes.jsonl", {"ts": ts, "source": "web", "pool": body.get("pool"), "symbol": body.get("symbol"),
+                                        "position": body.get("position"), "rule": body.get("rule"), **res})
+                return self._json(res)
+            if self.path == "/api/prefs":
+                # display only (no money, no rules): the trade header against other sites, no PIN
+                if self.headers.get("X-DLMM-Trade") != "1":
+                    return self._json({"ok": False, "error": "missing header"}, 403)
+                return self._json(prefs_set(body))
+            if self.path == "/api/flip":
+                why = self._trade_refused(body)
+                if why:
+                    return self._json({"ok": False, "error": why}, 403)
+                mode = str(body.get("mode") or "off")
+                if mode not in flip.MODES:
+                    return self._json({"ok": False, "error": "mode: off | alert | auto"}, 400)
+                if mode == "auto" and not node.trade_wallet().get("ok"):
+                    return self._json({"ok": False, "error": "flip auto butuh key di .env (DLMM_PRIVATE_KEY)"}, 400)
+                d = flip_set(str(body["pool"]), str(body.get("symbol") or ""), mode)
+                return self._json({"ok": True, "flip": {"pools": d["pools"], "positions": d["positions"]}})
+            if self.path == "/api/autoexit":
+                why = self._trade_refused(body)
+                if why:
+                    return self._json({"ok": False, "error": why}, 403)
+                if not node.trade_wallet().get("ok"):
+                    return self._json({"ok": False, "error": "auto exit butuh key di .env (DLMM_PRIVATE_KEY)"}, 400)
+                pct = body.get("pct")
+                pct = float(pct) if pct not in (None, "", 0, "0", "off") else None
+                if pct is not None and not 0.5 <= pct <= 100:
+                    return self._json({"ok": False, "error": "target 0.5–100%"}, 400)
+                return self._json({"ok": True, "autoExit": auto_set(str(body["pool"]), str(body.get("symbol") or ""), pct)})
+            if self.path in ("/api/settings", "/api/watchlist"):
+                why = self._trade_refused(body)
+                if why:
+                    return self._json({"ok": False, "error": why}, 403)
+                if self.path == "/api/watchlist":
+                    return self._json({"ok": True, "rows": watch_set(str(body["pool"]), str(body.get("symbol") or ""), bool(body.get("on")), body.get("note"))})
+                if body.get("reset"):
+                    settings.reset()
+                else:
+                    settings.save(self.base_cfg(), body.get("changes") or {})
+                self.reload_cfg()
+                return self._json({"ok": True, "form": settings.form(self.cfg, self.base_cfg()), "overlay": settings.load()})
+            if self.path == "/api/ladder/plan":
+                pos = self.cfg["position"]
+                args = node.ladder_args(str(body["pool"]), float(body["sol"]), int(body.get("slices") or pos.get("ladderSlices", 5)),
+                                        abs(float(body.get("bottom") or pos["rangeBottomPct"])), float(body.get("top") or 0),
+                                        str(body.get("strategy") or "spot"))
+                return self._json(node.run("open_ladder.mjs", args + ["--plan"]))
+        except (KeyError, ValueError) as exc:
+            return self._json({"ok": False, "error": f"{exc}"}, 400)
+        except Exception as exc:
+            return self._json({"ok": False, "error": str(exc)[:300]}, 502)
+        if self.path != "/api/decide":
+            return self._send(404, b"not found", "text/plain")
+        from .cli import append
+        row = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "source": "web", **{k: body.get(k) for k in
+               ("pool", "symbol", "decision", "decisionReason", "sizeSol", "level", "gatesFailed", "flags")}}
+        append("decisions.jsonl", row)
+        self._json({"ok": True, "logged": row})
+
+
+def serve(cfg: dict, host: str = "127.0.0.1", port: int = 8891, config_path: str | None = None) -> None:
+    Handler.cfg = cfg
+    Handler.config_path = config_path
+    threading.Thread(target=_auto_loop, args=(cfg,), daemon=True).start()   # auto exit (TP) for armed ladders
+    srv = ThreadingHTTPServer((host, port), Handler)
+    print(f"DLMM terminal web → http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}  (Ctrl+C to stop)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass

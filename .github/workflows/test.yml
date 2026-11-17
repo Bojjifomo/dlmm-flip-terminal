@@ -1,0 +1,43 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dlmm-terminal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Python tests
+        run: python -m unittest discover -s dlmm_terminal/tests -t .
+      - name: Executor tests
+        working-directory: dlmm_terminal/executor
+        run: |
+          npm ci --no-audit --no-fund
+          node test_ladder.mjs
+          node test_txutil.mjs
+          node test_flip.mjs
+  flip-bot:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: flip-bot
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
