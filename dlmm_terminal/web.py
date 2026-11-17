@@ -389,9 +389,15 @@ def _auto_file():
 
 def auto_load() -> dict:
     try:
-        return json.loads(_auto_file().read_text())
+        d = json.loads(_auto_file().read_text())
     except (OSError, ValueError):
         return {}
+    # messages saved by older versions can hold a whole Node crash dump: keep the line that says what happened
+    for a in d.values():
+        m = a.get("msg") or ""
+        if "node_modules" in m or "throw new Error" in m:
+            a["msg"] = node.short_error(m.replace(" ^ ", "\n").replace(" at ", "\n"))
+    return d
 
 
 def auto_save(d: dict) -> None:

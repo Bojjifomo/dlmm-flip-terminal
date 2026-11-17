@@ -665,10 +665,22 @@ function autoExitCell(p, pnlPct) {
     st = `<span class="tp on">🎯 nyala · close+swap di +${a.pct}%${left != null ? ` (kurang ${left.toFixed(2)}%)` : ""}</span>`;
   } else if (a && a.status === "firing") st = `<span class="tp warn">⏳ lagi close + swap…</span>`;
   else if (a && a.status === "selling") st = `<span class="tp warn">⏳ ${esc(a.msg || "token lagi dicoba jual")}</span>`;
-  else if (a && a.status === "done") st = `<span class="tp pos">✓ auto exit: ${esc(a.msg || "")}</span>`;
-  else if (a && a.status === "failed") st = `<span class="tp neg">✗ auto exit gagal: ${esc(a.msg || "")}</span>`;
+  else if (a && a.status === "done") st = `<span class="tp pos">✓ auto exit: ${esc(a.msg || "")} ${clearBtn(p.pool)}</span>`;
+  else if (a && a.status === "failed") st = `<span class="tp neg">✗ auto exit gagal: ${esc(a.msg || "")} ${clearBtn(p.pool)}</span>`;
   return `<div class="tpbox"><select class="tpsel" data-tp="${p.pool}" data-sym="${esc(p.symbol)}" title="Auto exit: close semua slice + jual token ke SOL saat PnL ladder ≥ target. Dicek server tiap ${state.pf.autoExitCheckMin || 2} menit (tanpa RPC) selama DLMM Web jalan.">${opts}</select>${st}</div>`;
 }
+// A finished / failed auto exit stays on the row until it is cleared (the select already reads "off", so it can't).
+const clearBtn = pool => `<button class="linkbtn" data-tpclear="${pool}" title="Hapus catatan ini (auto exit tetap off)">hapus</button>`;
+async function clearAutoExit(btn) {
+  if (!trade.ready()) { alert(trade.why()); return; }
+  btn.disabled = true;
+  try {
+    const r = await trade.call("/api/autoexit", { pool: btn.dataset.tpclear, pct: 0 });
+    state.pf.autoExit = r.autoExit;
+  } catch (e) { alert("Gagal: " + e.message); }
+  renderPortfolio();
+}
+document.addEventListener("click", e => { const b = e.target.closest("[data-tpclear]"); if (b) clearAutoExit(b); });
 async function setAutoExit(sel) {
   const pct = +sel.value;
   if (!trade.ready()) { alert(trade.why()); renderPortfolio(); return; }
@@ -878,7 +890,7 @@ function renderPortfolio() {
   // Auto exits of ladders that are gone from the list (closed): what happened to them, last 24 h.
   const gone = Object.entries(pf.autoExit || {}).filter(([pool, e]) => !groups.has(pool) && e.status !== "armed"
     && (Date.now() / 1000 - (e.firedAt || e.armedAt || 0)) < 86400);
-  $("#pfAuto").innerHTML = gone.map(([pool, e]) => `<div class="tp ${e.status === "done" ? "pos" : e.status === "failed" ? "neg" : "warn"}">🎯 ${esc(e.symbol || short(pool))}: ${esc(e.msg || e.status)}</div>`).join("");
+  $("#pfAuto").innerHTML = gone.map(([pool, e]) => `<div class="tp ${e.status === "done" ? "pos" : e.status === "failed" ? "neg" : "warn"}">🎯 ${esc(e.symbol || short(pool))}: ${esc(e.msg || e.status)} ${clearBtn(pool)}</div>`).join("");
   const x = pf.exitsCfg || {};
   $("#pfRules").textContent = `Exit rules: alert PnL ≤ ${x.alertAtPnlPct}% · alert 1/3 bawah range · close kalau ${x.closeBelowRangeAfterMin} menit di bawah range (SOL-only) · `
     + `TP ${x.takeProfitPct != null ? x.takeProfitPct : "off"} · SL ${x.stopLossPct != null ? x.stopLossPct : "off"}. Close di sini pakai key di .env (lu konfirmasi). Yang nutup sendiri 24 jam: "monitor --mode auto" di Mac.`
