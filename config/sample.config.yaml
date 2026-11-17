@@ -1,0 +1,82 @@
+# Copy jadi config.yaml. Dry-run cukup pubkey, nggak perlu private key.
+# Wallet di bawah cuma contoh biar perintah status bisa ditembak ke mainnet.
+# Ganti dengan pubkey hot wallet LP lo.
+
+mode: dry-run
+walletPubkey: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+pollIntervalMs: 20000
+stateFile: .state/bot-state.json
+commitment: confirmed
+
+# all = semua posisi terbuka di wallet.
+# selected = cuma pools / positions di bawah.
+# Kalau watch all DAN pools diisi, cuma pool itu yang diurus.
+watch: all
+
+# Pool ini cuma buat bukti baca mainnet (bin aktif). Bukan posisi lo.
+# Hapus kalau nggak mau.
+probePools:
+  - "ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq"
+
+pools: []
+# - address: "POOL_PUBKEY"
+#   rangeWidthBins: 40
+#   initialSide: bid
+#   tpMode: close
+#   maxFlipsPer24h: 4
+
+positions: []
+# - position: "POSITION_PUBKEY"
+#   pool: "POOL_PUBKEY"
+#   initialSide: bid
+
+excludePositions: []
+
+defaults:
+  # null = flip buka ulang dengan jumlah bin yang SAMA persis.
+  # freshRangeBins kepake cuma kalau posisinya nggak punya lebar.
+  rangeWidthBins: null
+  freshRangeBins: 70
+  maxBinsPerPosition: 1400
+  binGap: 1
+  # Jendela waktu. Dua-duanya harus lolos: menit adalah pagar utamanya.
+  confirmMinutes: 4
+  confirmChecks: 2
+  slippageBps: 100
+  priorityFeeMicroLamports: 50000
+  computeUnitLimit: 1400000
+  maxFlipsPer24h: 8
+  minSolReserveLamports: "50000000"
+  # 9900 = 99%. Trigger = share ini ATAU bin aktif benar-benar di luar range.
+  fullBaseBps: 9900
+  fullQuoteBps: 9900
+  # Gradual mati. Nyalain kalau mau kupas tiap N bin (15-30) sebelum OOR penuh.
+  gradualFlip: false
+  gradualFlipBins: 20
+  # 0.2 = 20% fee/TVL 24 jam. Cuma dicek pas harga di tengah range.
+  minFeeTvl: 0.2
+  feeTvlAction: alert
+  highTvlWarnUsd: 100000
+  staleAskHours: 12
+  skipTransferFee: true
+  minMarketCapUsd: 1000000
+  minPairAgeDays: 2
+  nearAthDrawdownPct: 30
+  # close = tutup semua ke quote lalu berhenti. keep_cycling = kabarin doang, tetap flip.
+  tpMode: keep_cycling
+  tpBufferLamports: "0"
+  tpBufferBps: 0
+  # TP cuma nyala setelah nilai principal sempat turun sekian bps dari modal (ada IL).
+  tpDrawdownArmBps: 50
+  tpConfirmChecks: 2
+  # resting = posisi di atas harga dianggap ask yang lagi nunggu, bukan bid yang udah ke-fill.
+  # filled = anggap posisi yang udah di luar range itu hasil tembus, langsung antri flip.
+  adoptOutOfRange: resting
+  initialSide: auto
+  # Pause kalau lagi pegang ask dan harga ambles sekian % di bawah lantai range.
+  maxDropBelowAskBottomPct: 25
+  minPoolTvlUsd: 0
+  minVolume24hUsd: 0
+  metricsFailClosed: false
+  allowInvertedQuote: false
+  sendMaxAttempts: 3

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.meteora.bidask-flip</string>
+  <key>WorkingDirectory</key>
+  <string>/GANTI/path/ke/repo</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>dist/cli.js</string>
+    <string>run</string>
+    <string>--config</string>
+    <string>config.yaml</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RPC_URL</key>
+    <string>https://mainnet.helius-rpc.com/?api-key=GANTI</string>
+    <key>WALLET_KEYPAIR_PATH</key>
+    <string>/GANTI/path/hot-wallet.json</string>
+    <key>TELEGRAM_BOT_TOKEN</key>
+    <string></string>
+    <key>TELEGRAM_CHAT_ID</key>
+    <string></string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/meteora-bidask-flip.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/meteora-bidask-flip.log</string>
+</dict>
+</plist>
