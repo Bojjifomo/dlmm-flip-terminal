@@ -10,7 +10,7 @@ import {
 import { NATIVE_MINT } from "@solana/spl-token";
 import { decodeBase58, encodeBase58 } from "../base58";
 import { simplePositionLimit } from "../decision/defaults";
-import { computeFlipRange, markToQuote, binPriceYPerX } from "../decision/math";
+import { capToBalance, computeFlipRange, markToQuote, binPriceYPerX } from "../decision/math";
 import type { PendingAction, Settings } from "../domain";
 import { loadPool } from "./pools";
 import { sendAndConfirm, signatureConfirmed } from "./tx";
@@ -28,10 +28,31 @@ export async function progressPending(args: {
     return pending;
   }
   if (pending.signature) {
-    const status = await signatureConfirmed(args.connection, pending.signature, args.commitment);
+    if (pending.signatureLastValidBlockHeight == null) {
+      // State lama tanpa lastValidBlockHeight: blockhash tx itu paling lama valid ~150 blok dari sekarang.
+      pending.signatureLastValidBlockHeight = (await args.connection.getBlockHeight(args.commitment)) + 150;
+    }
+    const status = await signatureConfirmed(
+      args.connection,
+      pending.signature,
+      args.commitment,
+      pending.signatureLastValidBlockHeight,
+    );
     if (status === "pending") return pending;
-    if (status === "failed") {
+    if (status === "expired") {
+      // Tx di-drop jaringan (block height exceeded). Aman dibangun ulang dari state on-chain terbaru.
       pending.signature = undefined;
+      pending.signatureLastValidBlockHeight = undefined;
+      pending.lastError = "tx sebelumnya kedaluwarsa (block height exceeded), dikirim ulang";
+      pending.attempts += 1;
+      if (pending.attempts >= args.settings.sendMaxAttempts * 2) {
+        pending.phase = "needs_human";
+        pending.lastError = "tx kedaluwarsa berulang. Cek RPC / priority fee, terus `ack` kalau udah beres manual.";
+        return pending;
+      }
+    } else if (status === "failed") {
+      pending.signature = undefined;
+      pending.signatureLastValidBlockHeight = undefined;
       pending.lastError = "tx sebelumnya gagal on-chain";
       pending.attempts += 1;
       if (pending.attempts >= args.settings.sendMaxAttempts) {
@@ -39,13 +60,15 @@ export async function progressPending(args: {
         pending.lastError = "tx gagal berulang. Cek Solscan, terus `ack` kalau udah beres manual.";
       }
       return pending;
+    } else {
+      pending.signatures = [...pending.signatures, pending.signature];
+      if (pending.lastSwapIn && pending.phase === "swap") {
+        subtractSwap(pending);
+      }
+      pending.signature = undefined;
+      pending.signatureLastValidBlockHeight = undefined;
+      pending.attempts = 0;
     }
-    pending.signatures = [...pending.signatures, pending.signature];
-    if (pending.lastSwapIn && pending.phase === "swap") {
-      subtractSwap(pending);
-    }
-    pending.signature = undefined;
-    pending.attempts = 0;
   }
 
   const dlmm = await loadPool(args.connection, pending.pool, true);
@@ -70,7 +93,7 @@ async function claimStep(
   pending: PendingAction,
   dlmm: DLMM,
 ): Promise<PendingAction> {
-  const position = await readPosition(dlmm, pending.fromPosition);
+  const position = await readPosition(args.connection, dlmm, pending.fromPosition);
   if (!position) {
     pending.phase = "remove";
     return pending;
@@ -101,7 +124,7 @@ async function removeStep(
   dlmm: DLMM,
 ): Promise<PendingAction> {
   accountFees(pending, dlmm);
-  const position = await readPosition(dlmm, pending.fromPosition);
+  const position = await readPosition(args.connection, dlmm, pending.fromPosition);
   if (!position) {
     return afterMemberClosed(pending);
   }
@@ -141,7 +164,7 @@ async function closeStep(
     pending.phase = "open";
     return pending;
   }
-  const position = await readPosition(dlmm, pending.fromPosition);
+  const position = await readPosition(args.connection, dlmm, pending.fromPosition);
   if (!position) return afterMemberClosed(pending);
   const data = position.positionData;
   const dust = asBigint(data.totalXAmount) + asBigint(data.totalYAmount);
@@ -160,6 +183,12 @@ async function openStep(
   dlmm: DLMM,
 ): Promise<PendingAction> {
   if (!pending.positionSecret || pending.minBinId == null || pending.maxBinId == null) {
+    await capDepositsToWallet(args, pending, dlmm);
+    if (BigInt(pending.depositX) <= 0n && BigInt(pending.depositY) <= 0n) {
+      pending.phase = "needs_human";
+      pending.lastError = "token buat deposit nggak ada di wallet. Cek saldo, terus `ack` kalau udah beres manual.";
+      return pending;
+    }
     const kp = pending.positionSecret
       ? Keypair.fromSecretKey(decodeBase58(pending.positionSecret))
       : Keypair.generate();
@@ -274,9 +303,15 @@ async function swapStep(
   dlmm: DLMM,
 ): Promise<PendingAction> {
   const quoteIsY = pending.quoteIsY !== false;
-  const amount = quoteIsY ? BigInt(pending.depositX) : BigInt(pending.depositY);
-  if (amount <= 0n) return finishSwap(pending);
   const swapForY = quoteIsY;
+  const inMint = swapForY ? dlmm.tokenX.publicKey : dlmm.tokenY.publicKey;
+  let amount = quoteIsY ? BigInt(pending.depositX) : BigInt(pending.depositY);
+  if (amount > 0n && !inMint.equals(NATIVE_MINT)) {
+    amount = capToBalance(amount, await walletTokenBalance(args.connection, args.owner.publicKey, inMint));
+    if (quoteIsY) pending.depositX = amount.toString();
+    else pending.depositY = amount.toString();
+  }
+  if (amount <= 0n) return finishSwap(pending);
   const binArrays = await dlmm.getBinArrayForSwap(swapForY);
   let quote;
   try {
@@ -414,12 +449,45 @@ function filledEnough(haveX: bigint, haveY: bigint, wantX: bigint, wantY: bigint
   return ok(haveX, wantX) && ok(haveY, wantY);
 }
 
-async function readPosition(dlmm: DLMM, position: string) {
+/**
+ * Posisi dianggap sudah tutup cuma kalau akun posisinya beneran nggak ada on-chain
+ * (mis. ditutup manual / proses lain). Error lain (bin array, RPC) tetap dilempar,
+ * biar bot nggak salah ngira posisi kosong lalu lanjut buka posisi baru.
+ */
+async function readPosition(connection: Connection, dlmm: DLMM, position: string) {
+  const key = new PublicKey(position);
+  const info = await connection.getAccountInfo(key);
+  if (!info) return null;
   try {
-    return await dlmm.getPosition(new PublicKey(position));
+    return await dlmm.getPosition(key);
   } catch (error) {
-    if (String(error).includes("not found")) return null;
+    if (String(error).includes(`Position account ${position} not found`)) return null;
     throw error;
+  }
+}
+
+/** Total saldo token `mint` di wallet (SPL & Token-2022), dalam unit terkecil. */
+async function walletTokenBalance(connection: Connection, owner: PublicKey, mint: PublicKey): Promise<bigint> {
+  const res = await connection.getParsedTokenAccountsByOwner(owner, { mint });
+  let total = 0n;
+  for (const row of res.value) {
+    const amount = (row.account.data as { parsed?: { info?: { tokenAmount?: { amount?: string } } } }).parsed?.info
+      ?.tokenAmount?.amount;
+    if (amount && /^\d+$/.test(amount)) total += BigInt(amount);
+  }
+  return total;
+}
+
+async function capDepositsToWallet(args: StepArgs, pending: PendingAction, dlmm: DLMM): Promise<void> {
+  const owner = args.owner.publicKey;
+  for (const [key, mint] of [
+    ["depositX", dlmm.tokenX.publicKey],
+    ["depositY", dlmm.tokenY.publicKey],
+  ] as const) {
+    const planned = BigInt(pending[key]);
+    if (planned <= 0n || mint.equals(NATIVE_MINT)) continue;
+    const capped = capToBalance(planned, await walletTokenBalance(args.connection, owner, mint));
+    pending[key] = capped.toString();
   }
 }
 
@@ -432,8 +500,9 @@ async function send(args: StepArgs, pending: PendingAction, tx: Transaction, sig
     computeUnitLimit: args.settings.computeUnitLimit,
     maxAttempts: args.settings.sendMaxAttempts,
     commitment: args.commitment,
-    onSignature: (signature) => {
+    onSignature: (signature, lastValidBlockHeight) => {
       pending.signature = signature;
+      pending.signatureLastValidBlockHeight = lastValidBlockHeight;
       pending.updatedAtMs = Date.now();
       args.onCheckpoint?.({ ...pending, positionSecret: pending.positionSecret });
     },

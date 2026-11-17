@@ -211,6 +211,8 @@ export interface PendingAction {
   positionSecret?: string;
   toPosition?: string;
   signature?: string;
+  /** lastValidBlockHeight dari blockhash tx `signature`, buat deteksi tx yang di-drop. */
+  signatureLastValidBlockHeight?: number;
   signatures: string[];
   attempts: number;
   lastError?: string;
