@@ -1,7 +1,20 @@
 node_modules/
 dist/
 .env
+.env.*
+!.env.example
 .state/
 *.log
 coverage/
 .DS_Store
+__pycache__/
+*.pyc
+
+# dlmm_terminal: data (posisi, log, settings, lock) + key
+dlmm_terminal/data/
+dlmm_terminal/.env
+dlmm_terminal/executor/node_modules/
+
+# file wallet
+*keypair*.json
+hot-wallet.json

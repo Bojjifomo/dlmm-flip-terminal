@@ -1,0 +1,62 @@
+{
+  "_note": "Starting values from DLMM-Auto-Entry-Spec v1 (133 closed positions, Oct 25 - Nov 4 2026). Change only after re-testing on unseen tokens (spec section 7).",
+  "universe": {"protocol": "meteora-dlmm", "quote": "SOL", "binStepMin": 20, "binStepMax": 250},
+  "gates": {"minPoolAgeMinutes": 60, "minFeeApr24hPct": 1000, "maxPositionPctOfTvl": null, "_maxPositionPctOfTvl": "off (owner, 2026-11-04); set a number like 3 to gate size vs TVL again"},
+  "position": {
+    "strategy": "Spot", "side": "SOL-only", "rangeBottomPct": -70,
+    "bankrollSol": 160, "lossBudgetPct": 5, "defaultSizeSol": 8,
+    "ladderSlices": 5, "_ladder": "RH ladder: equal-width slices from the price down to rangeBottomPct, SOL split 1:2:...:n (deepest slice biggest), Spot inside each"
+  },
+  "flags": {"pump1hPct": 25, "drop6hPct": -17, "minTvlUsd": 25000, "nightEntryLocalHours": [0, 9], "utcOffsetHours": 7},
+  "scan": {"pages": 2, "pageSize": 100, "prefilterMinTvlUsd": 1000},
+  "signal": {
+    "_note": "Entry ping: pool passes the v1 gates AND sits inside the benchmark wallet's habitat (bin steps it made SOL in + p10-p90 of pool age, mcap, fees 1h/24h at its entries). A similarity check on top of the gates, not a predictor (spec section 2).",
+    "benchmarkWallet": "WKX8JSQ7K4XNPHN24MjrDCi8fRVTr4KFkh4aa3TZmpt",
+    "benchmarkDays": 20,
+    "refreshBenchmarkHours": 24,
+    "mode": "blast",
+    "_mode": "blast = one card with the top blastTop pools every blastEveryMin; new = one ping per pool when it newly matches (cooldownHours)",
+    "blastEveryMin": 30,
+    "blastTop": 10,
+    "blastSortBy": "volTvl1h",
+    "_blastSortBy": "volTvl1h (1h Vol/TVL) | feeTvl24h (1d Fees/TVL) | fees1hUsd | prorated5m",
+    "pollEveryMin": 5,
+    "minMatchScore": 1.0,
+    "cooldownHours": 6,
+    "pingWalletEntries": true,
+    "revival": {
+      "_note": "Dead-then-alive pools (pump-and-dump on a quiet token, e.g. DAVID-SOL): >= minDeadHours hours in a row with fees < deadHourPct% of the 24h total AND the 3 busiest hours >= minTop3Share of 24h fees. Owner's call (2026-11-05): gate. Benchmark data: 4 such entries, all won (+1.42 SOL), so 'flag' keeps them with a warning, 'off' ignores it.",
+      "mode": "gate",
+      "minDeadHours": 6,
+      "minTop3Share": 0.7,
+      "deadHourPct": 0.5
+    },
+    "matchDims": ["tokenAgeHours", "mcapUsd", "volume24hUsd", "totalFeesSol"],
+    "_matchDims": "The filter = v1 gates + these bands (owner's GMGN filter, 2026-11-05: one layer, no benchmark layer). Available: tokenAgeHours, poolAgeHours, mcapUsd, volume24hUsd, totalFeesSol, fees24hUsd, fees1hUsd",
+    "requireBenchmarkBinSteps": false,
+    "_requireBenchmarkBinSteps": "true = also require a bin step the benchmark wallet made SOL in (the old layer 2). The benchmark wallet still drives the 👀 wallet-entry pings.",
+    "bandOverrides": {
+      "_note": "Owner's layer-2 bands, GMGN-style (2026-11-05): age 60m-15000m, mcap $400K-$10M, volume >= $50K, total fees >= 50 SOL. null = no limit. tokenAgeHours / volume24hUsd are token-wide (DexScreener, all pairs); totalFeesSol is this DLMM pool's LP fees since launch (GMGN's 'Total Fees' counts trader fees on every venue, no free source).",
+      "tokenAgeHours": {"lo": 1, "hi": 250},
+      "mcapUsd": {"lo": 400000, "hi": 10000000},
+      "volume24hUsd": {"lo": 50000, "hi": null},
+      "totalFeesSol": {"lo": 50, "hi": null}
+    },
+    "newEntryAlerts": true,
+    "newAlertCooldownHours": 6
+  },
+  "exits": {
+    "_note": "Spec section 4: every fixed TP / SL / trailing / time limit lost SOL vs. holding (TP +1/+2/+5/+10% = -7.16/-7.57/-4.37/-1.06 SOL). They stay null unless you turn them on.",
+    "mode": "alert",
+    "pollEveryMin": 5,
+    "alertAtPnlPct": -10,
+    "alertBottomThirdOfRange": true,
+    "closeBelowRangeAfterMin": 10,
+    "priceStopBelowEntryPct": null,
+    "takeProfitPct": null,
+    "stopLossPct": null,
+    "trailingPts": null,
+    "trailingArmPct": 1,
+    "maxHoldMin": null
+  }
+}
