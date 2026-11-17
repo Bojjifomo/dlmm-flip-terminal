@@ -289,3 +289,5 @@ tbody tr.sibrow td:first-child { box-shadow: inset 3px 0 0 #275a88; }
 .sale details summary { display: inline; cursor: pointer; list-style: none; }
 .sale details summary::-webkit-details-marker { display: none; }
 .sale details[open] summary { text-decoration: underline dotted; }
+.linkbtn { background: none; border: 0; padding: 0 2px; color: var(--muted); text-decoration: underline dotted; cursor: pointer; font: inherit; font-size: 11px; }
+.linkbtn:hover { color: var(--text, inherit); }

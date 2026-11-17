@@ -108,6 +108,13 @@ class AutoExitTest(unittest.TestCase):
         self.assertEqual(a["status"], "selling")
         self.assertEqual(a["sellTries"], 0)
 
+    def test_old_crash_dump_message_is_shortened(self):
+        import json
+        (self.tmp / "auto_exit.json").write_text(json.dumps({"POOL": {"status": "failed", "msg":
+            "/Users/x/dlmm-terminal/executor/node_modules/@meteora-ag/dlmm/dist/index.js:18350 throw new Error( ^ "
+            "Error: Position account w6z3 not found"}}))
+        self.assertEqual(web.auto_load()["POOL"]["msg"], "Position account w6z3 not found")
+
 
 class ShortErrorTest(unittest.TestCase):
     def test_crash_dump_becomes_one_line(self):
