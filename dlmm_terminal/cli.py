@@ -24,7 +24,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import activity, api, benchmark, blast, exits, filters
+from . import activity, api, benchmark, blast, exits, filters, flip
 
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "data"
@@ -367,11 +367,12 @@ def execute_close(t: exits.Tick, wallet: str, dry_run: bool) -> bool:
 
 def monitor_once(wallet: str, cfg: dict, states: dict, mode: str, dry_run: bool) -> None:
     ex, now = cfg["exits"], time.time()
+    flip_pools = flip.load(DATA / "flip.json")["pools"]      # flip armed in DLMM Web: it flips, the monitor does not close
     seen = set()
     for t in ticks_for_wallet(wallet, now):
         seen.add(t.position)
         st = exits.State.from_dict(states.get(t.position))
-        events = exits.evaluate(t, st, ex)
+        events = exits.evaluate(t, st, flip.exits_for(ex, t.pool in flip_pools))
         append("pnl_log.jsonl", {"ts": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
                                  "position": t.position, "pool": t.pool, "symbol": t.symbol,
                                  "pnlPct": t.pnl_pct, "pnlSol": t.pnl_sol, "peakPnlPct": st.peak_pnl,
@@ -396,6 +397,28 @@ def monitor_once(wallet: str, cfg: dict, states: dict, mode: str, dry_run: bool)
         states[t.position] = st.to_dict()
     for gone in set(states) - seen:
         states.pop(gone)
+
+
+def cmd_flip(a, cfg):
+    """Flip one position to the other side of the price (bid -> ask, ask -> bid)."""
+    from . import node
+    fc = {**flip.DEFAULTS, **(cfg.get("flip") or {})}
+    args = ["--pool", a.pool, "--position", a.position, "--to", a.to, "--gap", str(int(fc["gapBins"])),
+            "--slippage", str(float(fc["slippagePct"])), "--reserve", str(float(fc["minSolReserve"]))]
+    if a.force:
+        args.append("--force")
+    if a.dry_run:
+        owner = a.wallet or os.environ.get("DLMM_WALLET")
+        if not owner:
+            sys.exit("--dry-run needs --wallet (or DLMM_WALLET)")
+        args += ["--dry-run", "--owner", owner]
+    res = node.run("flip.mjs", args, timeout=600)
+    print(json.dumps(res, indent=1))
+    if not a.dry_run:
+        append("flips.jsonl", {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "source": "cli", "pool": a.pool,
+                               "position": a.position, "to": a.to, **{k: res.get(k) for k in ("ok", "error", "newPosition", "range")}})
+    if not res.get("ok"):
+        sys.exit(1)
 
 
 def cmd_monitor(a, cfg):
@@ -844,6 +867,13 @@ def main(argv=None):
     re_.add_argument("--dry-run", action="store_true")
     re_.add_argument("--owner")
     re_.add_argument("-y", "--yes", action="store_true")
+    fl = sub.add_parser("flip", help="bid-ask flip: close a position the price ran through, open it on the other side (same width, BidAsk)")
+    fl.add_argument("--pool", required=True)
+    fl.add_argument("--position", required=True)
+    fl.add_argument("--to", required=True, choices=["ask", "bid"], help="ask: token above the price (after a bid filled) · bid: SOL below the price")
+    fl.add_argument("--force", action="store_true", help="flip even when the price has not run through it on chain")
+    fl.add_argument("--dry-run", action="store_true", help="read + plan, send nothing")
+    fl.add_argument("--wallet", help="owner for --dry-run (default DLMM_WALLET)")
     sub.add_parser("doctor", help="cek setup: .env, key (tanpa nampilin key), wallet, RPC, PIN, port")
     sub.add_parser("followup", help="price 1h/6h/24h after each logged candidate")
     o = sub.add_parser("open", help="open a SOL-only Spot ladder (RH style, 5 slices) after the gates")
@@ -877,7 +907,7 @@ def main(argv=None):
     if a.cmd == "web":
         from . import web
         return web.serve(cfg, a.host, a.port, config_path=a.config)
-    {"screen": cmd_screen, "decide": cmd_decide, "monitor": cmd_monitor, "followup": cmd_followup, "open": cmd_open, "reenter": cmd_reenter, "doctor": cmd_doctor,
+    {"screen": cmd_screen, "decide": cmd_decide, "monitor": cmd_monitor, "followup": cmd_followup, "open": cmd_open, "reenter": cmd_reenter, "flip": cmd_flip, "doctor": cmd_doctor,
      "benchmark": cmd_benchmark, "signal": cmd_signal, "rpc": cmd_rpc}[a.cmd](a, cfg)
 
 

@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import api, exits, filters, node, settings
+from . import api, exits, filters, flip, node, settings
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "web"
@@ -538,6 +538,125 @@ def _holds(wallet: str, mint: str) -> bool:
         return True
 
 
+# ---------- bid-ask flip (per pool: off / alert / auto) ----------
+# data/flip.json: {"pools": {pool: {"mode", "symbol", "armedAt"}},
+#                  "positions": {position: {"pool", "side", "crossed_since", "checks", "msg", "ready", "to", "error"}},
+#                  "history": [{"pool", "symbol", "at", "position", "from", "to", "ok", "newPosition", "msg"}]}
+# Checked on the same clock as the auto exit (web.autoExitCheckMin), from Meteora's data API (no RPC); flip.mjs looks
+# at the position on chain again before it sends anything. While a pool is armed, the exit rules that would close a
+# bid that the price ran through (closeBelowRangeAfterMin, priceStopBelowEntryPct) leave it alone: the flip handles it.
+def _flip_file():
+    from .cli import DATA
+    return DATA / "flip.json"
+
+
+def flip_load() -> dict:
+    return flip.load(_flip_file())
+
+
+def flip_save(d: dict) -> None:
+    f = _flip_file()
+    f.parent.mkdir(exist_ok=True)
+    f.write_text(json.dumps(d, indent=1))
+
+
+def flip_set(pool: str, symbol: str, mode: str) -> dict:
+    with _auto_lock:
+        d = flip_load()
+        if mode == "off":
+            d["pools"].pop(pool, None)
+        else:
+            d["pools"][pool] = {"mode": mode, "symbol": symbol, "armedAt": time.time()}
+        flip_save(d)
+        return d
+
+
+def flip_cfg(cfg: dict) -> dict:
+    return {**flip.DEFAULTS, **(cfg.get("flip") or {})}
+
+
+def flip_run(cfg: dict, pool: str, position: str, to: str, symbol: str = "", force: bool = False, source: str = "auto") -> dict:
+    """Send one flip (flip.mjs) and record it."""
+    from .cli import append, notify
+    fc = flip_cfg(cfg)
+    args = ["--pool", pool, "--position", position, "--to", to, "--gap", str(int(fc["gapBins"])),
+            "--slippage", str(float(fc["slippagePct"])), "--reserve", str(float(fc["minSolReserve"]))]
+    if force:
+        args.append("--force")
+    res = node.run("flip.mjs", args, timeout=600)
+    ok = bool(res.get("ok"))
+    with _auto_lock:
+        d = flip_load()
+        st = d["positions"].get(position, {})
+        if ok:
+            d["positions"].pop(position, None)
+            d["positions"][res["newPosition"]] = {"pool": pool, "side": to, "fresh": time.time(),
+                                                  "msg": f"dibuka dari flip {st.get('side') or '?'} → {to}"}
+            msg = f"{st.get('side') or ('bid' if to == 'ask' else 'ask')} → {to}: posisi baru {res['newPosition'][:6]}… · bin {res['range']['lo']}..{res['range']['hi']}"
+        elif res.get("notReady"):
+            msg = res.get("error") or "belum nembus on chain"
+            if position in d["positions"]:
+                d["positions"][position].update(ready=False, msg=msg)
+        else:
+            msg = (res.get("error") or "gagal")[:220]
+            if position in d["positions"]:
+                d["positions"][position].update(error=msg, errorAt=time.time(), ready=False)
+        if not res.get("notReady"):
+            d["history"] = (d.get("history") or [])[-199:] + [{"pool": pool, "symbol": symbol, "at": time.time(), "position": position,
+                                                              "to": to, "ok": ok, "newPosition": res.get("newPosition"), "msg": msg, "source": source}]
+        flip_save(d)
+    if not res.get("notReady"):
+        append("flips.jsonl", {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "source": source, "pool": pool,
+                               "symbol": symbol, "position": position, "to": to,
+                               **{k: res.get(k) for k in ("ok", "error", "step", "newPosition", "range", "depositSol", "depositToken", "signatures")}})
+        notify(f"{'🔁' if ok else '❌'} FLIP {symbol or pool[:6]}: {msg}")
+    return res
+
+
+def flip_once(cfg: dict, wallet: str) -> list[dict]:
+    """One pass over the armed pools: update every position's flip state, send the flips that are due (auto) or
+    say they are ready (alert)."""
+    from .cli import notify, ticks_for_wallet
+    with _auto_lock:
+        armed = dict(flip_load()["pools"])
+    if not armed:
+        return []
+    fc, now = flip_cfg(cfg), time.time()
+    due, seen = [], set()
+    ticks = [t for t in ticks_for_wallet(wallet, now) if t.pool in armed]
+    with _auto_lock:
+        d = flip_load()
+        for t in ticks:
+            seen.add(t.position)
+            raw = d["positions"].get(t.position) or {"pool": t.pool}
+            st = flip.FlipState.from_dict(raw)
+            dec = flip.evaluate(now, t.price, t.range_min, t.range_max, t.sol_only, st, fc, flip.flips_24h(d, t.pool, now))
+            raw.update(st.to_dict(), pool=t.pool, msg=dec.msg, ready=dec.kind == "flip", to=dec.to)
+            if dec.kind == "wait":
+                raw.pop("error", None)
+                raw.pop("errorAt", None)
+            d["positions"][t.position] = raw
+            if dec.kind == "flip":
+                mode = armed[t.pool]["mode"]
+                if mode == "auto":
+                    if now - float(raw.get("errorAt") or 0) >= 600:      # a failed flip waits 10 min before the next try
+                        due.append((t, dec))
+                elif not st.notified:
+                    raw["notified"] = True
+                    notify(f"🔁 FLIP SIAP {t.symbol} {t.position[:6]}…: {dec.msg}. Klik Flip di Portfolio (mode alert).")
+        # forget positions of armed pools that are gone (closed / flipped)
+        # (a position a flip just opened is kept 30 min: Meteora's API lists it a few minutes late)
+        for pos in [p for p, v in d["positions"].items() if v.get("pool") in armed and p not in seen
+                    and not (v.get("fresh") and now - v["fresh"] < 1800)]:
+            d["positions"].pop(pos)
+        flip_save(d)
+    done = []
+    for t, dec in due:
+        res = flip_run(cfg, t.pool, t.position, dec.to, t.symbol, source="auto")
+        done.append({"pool": t.pool, "position": t.position, "to": dec.to, "ok": bool(res.get("ok"))})
+    return done
+
+
 def _auto_loop(cfg: dict) -> None:
     import sys
     while True:
@@ -545,6 +664,8 @@ def _auto_loop(cfg: dict) -> None:
             tw = node.trade_wallet()
             if tw.get("ok") and auto_load():
                 auto_exit_once(cfg, tw["pubkey"])
+            if tw.get("ok") and flip_load()["pools"]:
+                flip_once(cfg, tw["pubkey"])
         except Exception as exc:
             print(f"[auto-exit] {exc}", file=sys.stderr, flush=True)
         time.sleep(max(1, float((cfg.get("web") or {}).get("autoExitCheckMin", 2))) * 60)
@@ -559,11 +680,12 @@ def portfolio(wallet: str, cfg: dict) -> dict:
     except Exception:
         states = {}
     meta = {p["poolAddress"]: p for p in api.open_portfolio(wallet)}
+    fl = flip_load()
     rows, seen = [], set()
     for t in ticks_for_wallet(wallet, now):
         seen.add(t.position)
         st = exits.State.from_dict(states.get(t.position))
-        ev = exits.evaluate(t, st, cfg["exits"])
+        ev = exits.evaluate(t, st, flip.exits_for(cfg["exits"], t.pool in fl["pools"]))
         states[t.position] = st.to_dict()
         p = meta.get(t.pool, {})
         rows.append({
@@ -588,6 +710,7 @@ def portfolio(wallet: str, cfg: dict) -> dict:
     return {"wallet": wallet, "t": now, "rows": rows, "valueSol": f("balancesSol"), "unclaimedSol": f("unclaimedFeesSol"),
             "pnlSol": f("pnlSol"), "depositSol": f("totalDepositSol"), "exitsCfg": cfg["exits"],
             "walletSol": wallet_sol(wallet), "autoExit": auto_load(), "tpChoices": TP_CHOICES,
+            "flip": {"pools": fl["pools"], "positions": fl["positions"], "history": (fl.get("history") or [])[-20:], "cfg": flip_cfg(cfg)},
             "autoExitCheckMin": (cfg.get("web") or {}).get("autoExitCheckMin", 2)}
 
 
@@ -693,7 +816,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
         try:
-            if self.path in ("/api/trade/open", "/api/trade/close", "/api/trade/reenter", "/api/trade/cleanup", "/api/trade/sell"):
+            if self.path in ("/api/trade/open", "/api/trade/close", "/api/trade/reenter", "/api/trade/cleanup", "/api/trade/sell", "/api/trade/flip"):
                 why = self._trade_refused(body)
                 if why:
                     return self._json({"ok": False, "error": why}, 403)
@@ -721,6 +844,12 @@ class Handler(BaseHTTPRequestHandler):
                                                "positions": [r.get("position") for r in res.get("results", [])], "ok": res.get("ok"),
                                                "error": res.get("error")})
                     return self._json(res)
+                if self.path.endswith("/flip"):
+                    to = str(body["to"])
+                    if to not in ("ask", "bid"):
+                        return self._json({"ok": False, "error": "to: ask | bid"}, 400)
+                    return self._json(flip_run(self.cfg, str(body["pool"]), str(body["position"]), to, str(body.get("symbol") or ""),
+                                               force=bool(body.get("force")), source="web"))
                 if self.path.endswith("/sell"):
                     args = ["--mint", str(body["mint"]), "--maxloss", str(float(body.get("maxloss") or self.cfg["trade"]["maxLossPct"]))]
                     if body.get("pool"):
@@ -754,6 +883,17 @@ class Handler(BaseHTTPRequestHandler):
                 if self.headers.get("X-DLMM-Trade") != "1":
                     return self._json({"ok": False, "error": "missing header"}, 403)
                 return self._json(prefs_set(body))
+            if self.path == "/api/flip":
+                why = self._trade_refused(body)
+                if why:
+                    return self._json({"ok": False, "error": why}, 403)
+                mode = str(body.get("mode") or "off")
+                if mode not in flip.MODES:
+                    return self._json({"ok": False, "error": "mode: off | alert | auto"}, 400)
+                if mode == "auto" and not node.trade_wallet().get("ok"):
+                    return self._json({"ok": False, "error": "flip auto butuh key di .env (DLMM_PRIVATE_KEY)"}, 400)
+                d = flip_set(str(body["pool"]), str(body.get("symbol") or ""), mode)
+                return self._json({"ok": True, "flip": {"pools": d["pools"], "positions": d["positions"]}})
             if self.path == "/api/autoexit":
                 why = self._trade_refused(body)
                 if why:

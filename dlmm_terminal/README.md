@@ -1,4 +1,4 @@
-# DLMM Terminal: filter entry + auto exit (Solana LP)
+# DLMM Terminal: filter entry + auto exit + bid-ask flip (Solana LP)
 
 Implementasi **DLMM-Auto-Entry-Spec v1** (133 posisi closed, 23 token, Oct 25 – Nov 4 2026).
 Dua bagian:
@@ -116,6 +116,39 @@ Hasil replay 131 posisi tiap 5 menit, dibanding exit asli lu:
 Kenapa TP fix rugi: posisi SOL-only di bawah harga cuma dapet dari fee, PnL biasanya naik terus sampai akhir (winner median peak di menit 25 dari 28). TP nutup posisi yang masih ngasilin. Jadi "auto TP" default-nya: **satu-satunya rule yang nambah SOL** (keluar kalau udah 10 menit di bawah range) + alert buat sisanya. TP/SL/trailing tetep bisa dinyalain di `config.json`; monitor bakal kasih warning.
 
 `mode: "alert"` = cuma ngabarin ("exit rule hit, tutup sendiri"). `mode: "auto"` = executor nutup posisi. Sisa memecoin dari range **nggak** di-swap otomatis; jual sendiri (di data, jual sisa token makan −3.93 SOL).
+
+## Bid-ask flip (baru, dari `flip-bot/`)
+
+Per pool di Portfolio ada pilihan **flip: off / alert / auto**. Mekanismenya diambil dari bot flip (`flip-bot/`):
+
+- **bid → ask**: slice SOL-only di bawah harga, harga turun nembus bawahnya (slice jadi token semua). Slice ditutup (fee di-claim), tokennya dibuka lagi jadi range **token-only BidAsk di ATAS harga**, lebar bin sama. Tokennya kejual pas harga balik naik.
+- **ask → bid**: range token itu ketembus ke atas (jadi SOL semua). Ditutup, SOL-nya dibuka lagi jadi **SOL-only BidAsk di BAWAH harga**, lebar sama.
+- Baru jalan kalau harga stay di luar range minimal `flip.confirmMinutes` (4 menit) **dan** `flip.confirmChecks` (2) cek berturut-turut. Wick doang nggak ngitung. Maks `flip.maxFlipsPer24h` (8) per pool.
+- `alert`: lu dikabarin (Telegram + browser), tombol **Flip → ask/bid** muncul di baris slice. `auto`: server langsung kirim.
+- Sebelum kirim, `flip.mjs` ngecek posisi **on-chain** lagi (API Meteora bisa telat). Kalau belum ketembus beneran, dia nolak (`notReady`) dan nunggu cek berikutnya.
+- Selama flip nyala di pool itu, rule `closeBelowRangeAfterMin` / `priceStopBelowEntryPct` **nggak** nutup slice-nya (di web dan di `monitor --mode auto`): slice yang ketembus di-flip, bukan di-close.
+- Cuma jalan selama DLMM Web nyala (sama kayak auto exit). Semua flip ke `data/flips.jsonl`.
+
+Manual dari Terminal:
+
+```bash
+python3 -m dlmm_terminal flip --pool <POOL> --position <POSISI> --to ask --dry-run --wallet <WALLET>
+python3 -m dlmm_terminal flip --pool <POOL> --position <POSISI> --to ask
+```
+
+Angka di `config.json` → `flip` (`gapBins`, `slippagePct`, `minSolReserve` buat sisa SOL di wallet).
+
+Risiko: token yang terus turun bikin lu pegang token di ask yang nggak pernah ke-fill (sama kayak bot flip). Flip nggak ngejual rugi; buat keluar, pakai Close+swap.
+
+## Perbaikan dari versi lama (error di Portfolio)
+
+| Error lama | Penyebab | Sekarang |
+| --- | --- | --- |
+| `sold X/Y in 2 pieces, the rest failed ... insufficient funds` (Jupiter `0x1788`, Token `0x1`) | Jumlah dibaca sekali di awal, terus beberapa proses (tombol Jual, Cleanup, retry auto exit, Close+swap) jual token yang sama barengan. Token di account selain ATA juga nggak bisa dipakai swap | Satu penjualan per token (lock). Tiap bagian diukur dari saldo **sekarang**. Token di account lain digabung ke ATA dulu. Swap yang error tapi ternyata landing dihitung terjual |
+| `auto exit gagal: ... Position account ... not found` | API Meteora masih nampilin slice yang udah ditutup (`monitor --mode auto` / manual), `reenter` crash | Slice yang udah tutup dilewatin, sisanya tetap di-close + swap. Satu penutup per posisi (lock). Error selalu satu baris, bukan stack trace |
+| `Signature ... has expired: block height exceeded` | Tx telat landing, langsung dianggap gagal | Status tx dicek on-chain dulu. Yang beneran expired dikirim ulang pakai blockhash baru, yang ternyata landing nggak dikirim dua kali (juga di `open_ladder`, jadi slice nggak kebuka dobel) |
+| `BAWSAQ: posisi sudah nggak ada` + tokennya nyangkut | Ladder ditutup di tempat lain, auto exit cuma nyerah | Kalau tokennya masih di wallet, auto exit jual tokennya |
+| Tombol hijau "Jual ke SOL" di token "tanpa harga" | Ringkasan bilang nggak bisa dijual, tombolnya bilang bisa | Token tanpa harga dipisah, tombolnya "coba jual" (ditolak tanpa biaya kalau nggak ada pasar). Error penjualan panjang dilipat |
 
 ## Log (buat v2)
 

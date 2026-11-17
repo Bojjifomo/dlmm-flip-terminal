@@ -681,6 +681,51 @@ async function setAutoExit(sel) {
   renderPortfolio();
 }
 
+// Bid-ask flip per pool (off / alert / auto): a SOL slice the price fell through is reopened as token above the
+// price (ask), and back to SOL below the price when the price runs up through it. The server checks on the same
+// clock as the auto exit; "alert" waits for the Flip button here, "auto" sends it.
+function flipCell(p, rows) {
+  const F = state.pf.flip || { pools: {}, positions: {} };
+  const cur = (F.pools[p.pool] || {}).mode || "off";
+  const label = { off: "flip: off", alert: "flip: alert (tanya dulu)", auto: "flip: auto" };
+  const opts = ["off", "alert", "auto"].map(v => `<option value="${v}" ${v === cur ? "selected" : ""}>${label[v]}</option>`).join("");
+  const lines = cur === "off" ? [] : rows.map(r => {
+    const st = F.positions[r.position] || {};
+    const btn = st.ready && st.to ? `<button class="btn go" data-flip="${r.position}" data-to="${st.to}" data-pool="${p.pool}" data-sym="${esc(p.symbol)}">Flip → ${st.to}</button>` : "";
+    const err = st.error ? ` <span class="neg">✗ ${esc(st.error)}</span>` : "";
+    return `<div class="tp ${st.ready ? "warn" : "muted"}">${esc(short(r.position))} · ${esc(st.msg || "nunggu cek berikutnya")}${err}${btn ? `<div>${btn}</div>` : ""}</div>`;
+  });
+  const last = (F.history || []).filter(h => h.pool === p.pool).slice(-1)[0];
+  if (last) lines.push(`<div class="tp ${last.ok ? "pos" : "neg"}">🔁 terakhir ${new Date(last.at * 1000).toLocaleTimeString()}: ${esc(last.msg || "")}</div>`);
+  return `<div class="tpbox"><select class="tpsel" data-flipmode="${p.pool}" data-sym="${esc(p.symbol)}" title="Bid-ask flip: slice SOL yang ketembus harga dibuka lagi jadi token di atas harga (ask), lalu balik jadi SOL di bawah harga kalau harga naik nembus. Lebar bin sama, bentuk BidAsk.">${opts}</select>${lines.join("")}</div>`;
+}
+async function setFlipMode(sel) {
+  const mode = sel.value;
+  if (!trade.ready()) { alert(trade.why()); renderPortfolio(); return; }
+  if (mode !== "off" && !confirm(`Nyalain FLIP (${mode}) buat ${sel.dataset.sym}?\n\nKalau harga turun nembus slice SOL (semua jadi token) selama ${(state.pf.flip?.cfg?.confirmMinutes) ?? 4} menit, slice itu ditutup lalu tokennya dibuka lagi sebagai range token-only di ATAS harga (BidAsk, lebar bin sama). Kalau harga naik nembus range itu, balik jadi SOL di BAWAH harga.\n${mode === "auto" ? "Mode AUTO: server langsung kirim tx pakai key di .env, tanpa nanya." : "Mode ALERT: lu dikabarin, tombol Flip muncul di sini."}\n\nSelama nyala, rule "close kalau di bawah range" nggak nutup pool ini. Cuma jalan selama DLMM Web nyala.`)) { renderPortfolio(); return; }
+  try {
+    const r = await trade.call("/api/flip", { pool: sel.dataset.flipmode, symbol: sel.dataset.sym, mode });
+    state.pf.flip = { ...(state.pf.flip || {}), ...r.flip };
+    toast(mode === "off" ? `Flip ${sel.dataset.sym} mati` : `🔁 Flip ${sel.dataset.sym}: ${mode}`);
+  } catch (e) { alert("Gagal: " + e.message); }
+  renderPortfolio();
+}
+async function flipNow(btn) {
+  if (!trade.ready()) { alert(trade.why()); return; }
+  const to = btn.dataset.to;
+  if (!confirm(`FLIP ${btn.dataset.sym} → ${to}\n${to === "ask" ? "Tutup slice ini (udah jadi token), buka tokennya sebagai range token-only di atas harga." : "Tutup range token ini (udah jadi SOL), buka SOL-nya sebagai range SOL-only di bawah harga."}\nLebar bin sama, BidAsk. Lanjut?`)) return;
+  btn.disabled = true;
+  btn.textContent = "flip…";
+  try {
+    const s = await trade.call("/api/trade/flip", { pool: btn.dataset.pool, position: btn.dataset.flip, to, symbol: btn.dataset.sym });
+    toast(s.ok ? `🔁 ${btn.dataset.sym} → ${to}: posisi baru ${short(s.newPosition)}` : `✗ flip: ${s.error || "gagal"}`);
+    setTimeout(loadPortfolio, 4000);
+  } catch (e) { alert("Gagal: " + e.message); }
+  finally { btn.disabled = false; }
+}
+document.addEventListener("click", e => { const b = e.target.closest("[data-flip]"); if (b) flipNow(b); });
+document.addEventListener("change", e => { const s = e.target.closest("[data-flipmode]"); if (s) setFlipMode(s); });
+
 // Tokens left in the wallet (what a close left behind), each with its own "Jual ke SOL" button, and
 // the last sales with their exact outcome (data/swaps.jsonl), so a sale that did not happen says why.
 async function loadLeftovers() {
@@ -717,7 +762,7 @@ function renderLeftovers() {
   const T = d.total || { count: d.rows.length, valueUsd: 0, dust: dust, unpriced: 0, worth: worth.length };
   const val = T.valueUsd ? (solUsd() && state.unit !== "usd" ? fmtSol(T.valueUsd / solUsd(), 3) : fmtUsd(T.valueUsd)) : "$0";
   const summary = `<div class="tkh">💩 Total token sisa: <b>${T.count}</b> <span class="muted">(belum jadi SOL)</span> · nilai ≈ <b>${val}</b>
-      <div class="sub">${T.worth} layak dijual (≥ $0.10) · ${T.dust} receh (&lt; $0.10, Cleanup nggak jual) · ${T.unpriced} tanpa harga / nggak ada pasar (nggak bisa dijual)</div>
+      <div class="sub">${T.worth} layak dijual (≥ $0.10) · ${T.dust} receh (&lt; $0.10, Cleanup nggak jual) · ${T.unpriced} tanpa harga (biasanya nggak ada pasar)</div>
       ${T.count === 0 ? '<div class="pos">✓ Bersih: nggak ada token sisa.</div>' : T.worth === 0 ? '<div class="pos">✓ Nggak ada lagi yang layak dijual. Sisanya receh / nggak ada pasar.</div>' : ""}</div>`;
   el.innerHTML = summary + (rows ? `<div class="tkh">Token sisa yang layak dijual</div>${rows}` : "")
     + (unpricedRows ? `<div class="tkh">Tanpa harga <span class="muted">(biasanya nggak ada pasar; "coba jual" nggak bayar apa-apa kalau ditolak)</span></div>${unpricedRows}` : "")
@@ -805,6 +850,7 @@ function renderPortfolio() {
       <div class="lc3">${status}</div>
       <div class="lbtns"><button class="btn ${exit ? "danger" : ""}" data-close="${ids}">${exit ? "Exit" : "Close"}</button><button class="btn" data-swap="${ids}">Close+swap</button><button class="btn go" data-reenter="${ids}">Re-entry</button></div>
       ${autoExitCell(p, pnlPct)}
+      ${flipCell(p, rows)}
     </div>`);
     return `<tr>
       <td><span class="sym">${esc(p.symbol)}${pingOf(p.pool) ? `<span class="rank">📡#${pingOf(p.pool).rank}</span>` : ""}</span><span class="sub">${n} slice · ${held ? age(held / 60) : "--"}${holdsToken ? " · pegang token" : ""}</span></td>
@@ -816,6 +862,7 @@ function renderPortfolio() {
         <button class="btn" data-swap="${ids}" title="Close semua slice + jual token ke SOL">Close+swap</button>
         <button class="btn go" data-reenter="${ids}" title="Close + jual token + buka ladder lagi di harga sekarang (juga kalau masih in range)">Re-entry</button>
         ${autoExitCell(p, pnlPct)}
+        ${flipCell(p, rows)}
         <a href="https://app.meteora.ag/dlmm/${p.pool}" target="_blank" rel="noopener">meteora ↗</a></td>
     </tr>`;
   }).join("");
@@ -834,7 +881,8 @@ function renderPortfolio() {
   $("#pfAuto").innerHTML = gone.map(([pool, e]) => `<div class="tp ${e.status === "done" ? "pos" : e.status === "failed" ? "neg" : "warn"}">🎯 ${esc(e.symbol || short(pool))}: ${esc(e.msg || e.status)}</div>`).join("");
   const x = pf.exitsCfg || {};
   $("#pfRules").textContent = `Exit rules: alert PnL ≤ ${x.alertAtPnlPct}% · alert 1/3 bawah range · close kalau ${x.closeBelowRangeAfterMin} menit di bawah range (SOL-only) · `
-    + `TP ${x.takeProfitPct != null ? x.takeProfitPct : "off"} · SL ${x.stopLossPct != null ? x.stopLossPct : "off"}. Close di sini pakai key di .env (lu konfirmasi). Yang nutup sendiri 24 jam: "monitor --mode auto" di Mac.`;
+    + `TP ${x.takeProfitPct != null ? x.takeProfitPct : "off"} · SL ${x.stopLossPct != null ? x.stopLossPct : "off"}. Close di sini pakai key di .env (lu konfirmasi). Yang nutup sendiri 24 jam: "monitor --mode auto" di Mac.`
+    + ` Pool yang flip-nya nyala nggak ditutup rule bawah-range: slice yang ketembus di-flip.`;
 }
 
 // ---------- settings (⚙): everything the terminal decides with, saved in data/settings.json ----------

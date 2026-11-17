@@ -81,7 +81,7 @@ if (dry) {
     // `held` is in lamports of the mint's decimals only when the SDK reports raw amounts (it does)
     sale = { tokenRaw: held, ...(await sellToSol(tokenMint, String(Math.floor(held)), { connection, owner, maxLossPct: maxLoss, pool, dry: true })) };
   }
-  out({ ok: true, mode: "dry-run", pool, activeId: active.binId, tokenMint, positions: view, sale, reopen });
+  out({ ok: true, mode: "dry-run", pool, activeId: active.binId, tokenMint, positions: view, ...(gone.length ? { alreadyClosed: gone } : {}), sale, reopen });
   process.exit(0);
 }
 

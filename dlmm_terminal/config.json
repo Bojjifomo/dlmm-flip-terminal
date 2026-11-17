@@ -45,6 +45,15 @@
     "newEntryAlerts": true,
     "newAlertCooldownHours": 6
   },
+  "flip": {
+    "_note": "Bid-ask flip (from flip-bot/): a SOL-only slice the price fell through is reopened as a token-only BidAsk range above the price (same bins), and back to SOL below the price when the price runs up through it. Armed per pool in Portfolio (off / alert / auto). While armed, closeBelowRangeAfterMin and priceStopBelowEntryPct do not close that pool's positions.",
+    "confirmMinutes": 4,
+    "confirmChecks": 2,
+    "maxFlipsPer24h": 8,
+    "gapBins": 1,
+    "slippagePct": 1,
+    "minSolReserve": 0.05
+  },
   "exits": {
     "_note": "Spec section 4: every fixed TP / SL / trailing / time limit lost SOL vs. holding (TP +1/+2/+5/+10% = -7.16/-7.57/-4.37/-1.06 SOL). They stay null unless you turn them on.",
     "mode": "alert",
