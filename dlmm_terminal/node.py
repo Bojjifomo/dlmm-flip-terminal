@@ -10,6 +10,10 @@ import json
 import os
 import shutil
 import subprocess
+import threading
+import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import urllib.request
 from pathlib import Path
@@ -84,22 +88,95 @@ def last_json(stdout: str) -> dict | None:
         return None
 
 
+# ---------- live activity: jobs whose steps the executor reports while it runs ----------
+# The executor writes "@@{json}" lines on stderr (executor/progress.mjs). run() reads them as they come and adds them
+# to the job of the calling thread (job_context), which the web shows in its 📡 activity panel.
+JOBS: dict = {}
+_jobs_lock = threading.Lock()
+_tls = threading.local()
+
+
+def job_start(title: str, kind: str = "manual") -> dict:
+    job = {"id": uuid.uuid4().hex[:10], "title": title, "kind": kind, "t0": time.time(), "steps": [], "done": False,
+           "ok": None, "result": None}
+    with _jobs_lock:
+        JOBS[job["id"]] = job
+        for jid in sorted(JOBS, key=lambda k: JOBS[k]["t0"])[:-40]:      # keep the last 40
+            JOBS.pop(jid, None)
+    return job
+
+
+def job_step(msg: str, ok: bool | None = None, job: dict | None = None) -> None:
+    job = job or getattr(_tls, "job", None)
+    if job is None:
+        return
+    with _jobs_lock:
+        job["steps"].append({"t": time.time(), "msg": str(msg)[:300], "ok": ok})
+        del job["steps"][:-120]
+
+
+def job_finish(job: dict, res: dict) -> None:
+    with _jobs_lock:
+        job["done"], job["ok"], job["result"], job["t1"] = True, bool(res.get("ok")), res, time.time()
+
+
+@contextmanager
+def job_context(job: dict):
+    prev = getattr(_tls, "job", None)
+    _tls.job = job
+    try:
+        yield job
+    finally:
+        _tls.job = prev
+
+
+def jobs_view(limit: int = 12) -> list[dict]:
+    with _jobs_lock:
+        rows = sorted(JOBS.values(), key=lambda j: -j["t0"])[:limit]
+        return [{k: (v if k != "result" else None) for k, v in j.items()} | {"error": (j.get("result") or {}).get("error")} for j in rows]
+
+
 def run(script: str, args: list[str], timeout: int = 240) -> dict:
     missing = ready()
     if missing:
         return {"ok": False, "error": missing}
     env = {**os.environ, "SOLANA_RPC_URL": rpc_url()}
+    job = getattr(_tls, "job", None)
+    proc = subprocess.Popen(["node", str(EXECUTOR / script), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env, bufsize=1)
+    err: list[str] = []
+
+    def read_err():
+        for line in proc.stderr:
+            if line.startswith("@@"):
+                try:
+                    p = json.loads(line[2:])
+                    job_step(p.get("msg", ""), p.get("ok"), job)
+                    continue
+                except ValueError:
+                    pass
+            err.append(line)
+
+    reader = threading.Thread(target=read_err, daemon=True)
+    reader.start()
+    timer = threading.Timer(timeout, proc.kill)
+    timer.start()
     try:
-        r = subprocess.run(["node", str(EXECUTOR / script), *args], capture_output=True, text=True, timeout=timeout, env=env)
-    except subprocess.TimeoutExpired as exc:
-        out = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        out = proc.stdout.read()
+        proc.wait()
+    finally:
+        timer.cancel()
+    reader.join(timeout=5)
+    stderr = "".join(err)
+    if proc.returncode is not None and proc.returncode < 0 and not timer.is_alive() and not out.strip().endswith("}"):
+        job_step(f"✗ {script} dihentikan setelah {timeout} detik", False, job)
         return {"ok": False, "error": f"{script} masih jalan setelah {timeout} detik dan dihentikan; cek Portfolio / Solscan "
                 "sebelum coba lagi (sebagian langkah mungkin udah terkirim).", "stdout": out[-2000:]}
-    res = last_json(r.stdout)
+    res = last_json(out)
     if res is not None:
         log_rpc(script, args, res)
         return res
-    return {"ok": r.returncode == 0, "error": short_error(r.stderr or r.stdout), "stdout": r.stdout[-2000:]}
+    return {"ok": proc.returncode == 0, "error": short_error(stderr or out), "stdout": out[-2000:]}
 
 
 def short_error(text: str) -> str:

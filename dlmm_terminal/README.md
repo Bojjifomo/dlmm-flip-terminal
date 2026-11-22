@@ -117,6 +117,17 @@ Kenapa TP fix rugi: posisi SOL-only di bawah harga cuma dapet dari fee, PnL bias
 
 `mode: "alert"` = cuma ngabarin ("exit rule hit, tutup sendiri"). `mode: "auto"` = executor nutup posisi. Sisa memecoin dari range **nggak** di-swap otomatis; jual sendiri (di data, jual sisa token makan −3.93 SOL).
 
+## 📡 Aktivitas live
+
+Tiap kali lu buka ladder, close, close+swap, re-entry, jual, cleanup, atau flip, panel **📡 Aktivitas** muncul di pojok kanan bawah (di HP: di atas bar bawah). Isinya langkah demi langkah:
+
+- baca pool, cek saldo
+- slice 1/3, 2/3, … kebuka atau ditutup
+- jual token lewat rute mana (dan kalau gagal, kenapa)
+- nunggu SOL kebaca, lalu buka ladder lagi
+
+Auto exit, auto re-entry, dan flip otomatis juga muncul di situ (tandanya "auto"). Server nyimpen 40 aktivitas terakhir sampai dia di-restart.
+
 ## ♻️ Auto re-entry per ladder
 
 Di Portfolio, tiap ladder punya pilihan **re-entry: off / ≥ +5% di atas range**. Kalau harga naik keluar ladder SOL-only (semua slice jadi SOL lagi) dan bertahan minimal **+5% di atas batas atas range** selama 2 cek berturut-turut, server:
