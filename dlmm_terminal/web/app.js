@@ -714,7 +714,7 @@ async function reenterPool(p, btn, reopen) {
   const group = state.pf.rows.filter(x => x.pool === p.pool);
   const slices = group.length, bottom = Math.abs(Math.min(...group.map(x => x.rangeMin)) / Math.max(...group.map(x => x.rangeMax)) * 100 - 100) || 70;
   const msg = reopen
-    ? `RE-ENTRY ${p.symbol}\n1) Close ${slices} posisi di pool ini (klaim fee)\n2) Jual sisa token ke SOL (batal kalau >5% di bawah harga pool; kalau gagal, tokennya ditinggal buat Cleanup)\n3) Buka ladder lagi di harga sekarang: ${slices} slice, sampai −${bottom.toFixed(0)}%, pakai semua SOL yang balik\n\nLanjut?`
+    ? `RE-ENTRY ${p.symbol}\n1) Close ${slices} posisi di pool ini (klaim fee)\n2) Jual sisa token ke SOL (batal kalau >5% di bawah harga pool; kalau gagal, tokennya ditinggal buat Cleanup)\n3) Buka ladder yang sama lagi di harga sekarang: ${slices} slice, sampai −${bottom.toFixed(0)}%, modalnya = SOL ladder ini (posisi + hasil jual token). Fee tetap di wallet.\n\nSatu re-entry jalan satu-satu: tunggu yang lain selesai dulu.\n\nLanjut?`
     : `CLOSE + SWAP ${p.symbol}\nClose ${slices} posisi, lalu jual sisa token ke SOL via Jupiter (batal kalau >5% di bawah harga pool).\n\nLanjut?`;
   // Re-entry opens a new ladder: the same entry rules apply (the Nov 2026 review: entering right after a
   // +5% hour made ~0.4% vs ~2.5%). Close + swap is an exit, so it is never held back.

@@ -417,6 +417,7 @@ def wallet_sol(wallet: str) -> float | None:
 # without --reopen, the Close+swap button). Spec v1 found fixed take-profits lost SOL vs. manual
 # exits; this is off until you arm it.
 _auto_lock = threading.Lock()
+_reenter_lock = threading.Lock()       # one re-entry (close + re-open) at a time, manual or auto
 TP_CHOICES = (3, 5, 10)
 
 
@@ -792,7 +793,17 @@ def reentry_once(cfg: dict, wallet: str) -> list[dict]:
         args = ["--pool", pool, "--positions", ",".join(s["position"] for s in slices), "--maxloss", str(cfg["trade"]["maxLossPct"]),
                 "--reopen", "--slices", str(pl["slices"]), "--bottom", str(pl["bottom"]), "--top", "0",
                 "--strategy", a.get("strategy") or "spot"]
-        res = node.run("reenter.mjs", args, timeout=1500)
+        if not _reenter_lock.acquire(blocking=False):      # a manual re-entry is running: next check
+            with _auto_lock:
+                d = reentry_load()
+                if pool in d["pools"]:
+                    d["pools"][pool].update(status="armed", msg="nunggu re-entry lain selesai")
+                    reentry_save(d)
+            continue
+        try:
+            res = node.run("reenter.mjs", args, timeout=1500)
+        finally:
+            _reenter_lock.release()
         ok = bool(res.get("ok"))
         msg = (f"re-entry ◎{res.get('reopenSol')} · {pl['slices']} slice" if ok
                else f"{res.get('step') or ''} {res.get('error') or 'gagal'}")[:220]
@@ -1041,8 +1052,13 @@ class Handler(BaseHTTPRequestHandler):
                     if body.get("reopen"):
                         args += ["--reopen", "--slices", str(int(body.get("slices") or len(positions) or pos.get("ladderSlices", 5))),
                                  "--bottom", str(abs(float(body.get("bottom") or pos["rangeBottomPct"]))), "--top", str(float(body.get("top") or 0)),
-                                 "--strategy", str(body.get("strategy") or "spot")]
-                    res = node.run("reenter.mjs", args, timeout=1500)
+                                 "--strategy", str(body.get("strategy") or pos.get("strategy") or "spot").lower()]
+                    if not _reenter_lock.acquire(blocking=False):
+                        return self._json({"ok": False, "step": "busy", "error": "re-entry / close+swap lain lagi jalan: tunggu selesai dulu (biar SOL-nya nggak ketuker antar ladder)"})
+                    try:
+                        res = node.run("reenter.mjs", args, timeout=1500)
+                    finally:
+                        _reenter_lock.release()
                     append("closes.jsonl", {"ts": ts, "source": "web", "pool": body.get("pool"), "symbol": body.get("symbol"),
                                             "positions": positions, "rule": "reenter" if body.get("reopen") else "close-swap", **{k: res.get(k) for k in ("ok", "error", "step", "solBack", "reopenSol")}})
                     return self._json(res)
