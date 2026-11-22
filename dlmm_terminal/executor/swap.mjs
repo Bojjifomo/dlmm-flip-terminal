@@ -4,6 +4,7 @@
 //   Jupiter: price impact it reports, and (when a pool is known) the pool's active price.
 //   DLMM:    the pool's active price vs. what the swap quote returns.
 // Used by reenter.mjs (Close+swap / Re-entry / auto exit) and cleanup.mjs.
+import { progress } from "./progress.mjs";
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -212,8 +213,9 @@ async function sellToSolInner(mint, rawAmount, opts) {
       return gone * 100n >= amount * 99n ? { ok: true, via: "?", sol: 0, note: "reported an error but landed" } : null;
     };
     const attempt = async (name, fn) => {
-      try { return { res: await fn() }; }
-      catch (e) { note(name, e); return { err: e, res: await landedAnyway(e) }; }
+      progress(`jual ${tag}lewat ${name}…`);
+      try { const res = await fn(); progress(`✓ kejual ${tag}lewat ${name}${res && res.sol ? ` · ◎${Number(res.sol).toFixed(4)}` : ""}`, { ok: true }); return { res }; }
+      catch (e) { note(name, e); progress(`✗ ${tag}${name}: ${clip(e.message || e, 120)}`, { ok: false }); return { err: e, res: await landedAnyway(e) }; }
     };
     let r = await attempt("Jupiter", () => jup(amount, {}, ""));
     if (r.res) return r.res;

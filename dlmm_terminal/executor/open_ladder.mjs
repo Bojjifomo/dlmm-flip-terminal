@@ -16,6 +16,7 @@
 import fs from "node:fs";
 import { createRequire } from "node:module";
 
+import { progress } from "./progress.mjs";
 const require = createRequire(import.meta.url);
 const DLMMmod = require("@meteora-ag/dlmm");
 const { Connection, Keypair, PublicKey, sendAndConfirmTransaction, ComputeBudgetProgram } = require("@solana/web3.js");
@@ -67,6 +68,7 @@ if (mode === "send") {
 }
 
 let connection, dlmm;
+if (mode === "send") progress("baca pool + rencana ladder…");
 if (mode === "plan") {
   dlmm = await withReadConnection(c => { connection = c; return DLMM.create(c, new PublicKey(pool)); });
 } else {
@@ -93,6 +95,7 @@ const rentPerPosition = 0.0419e9; // a position account (8120 bytes), returned o
 // A wider slice is one extended position: rent grows with its bins (about 0.0000x SOL per bin over 70).
 const rentOf = s => s.width > 70 ? rentPerPosition + (s.width - 70) * 0.00060e9 : rentPerPosition;
 const need = Number(lamports) + plan.slices.reduce((a, s) => a + rentOf(s), 0) + 0.02e9;
+if (mode === "send") progress(`cek saldo wallet: ◎${(balance / 1e9).toFixed(3)} (butuh ±◎${(need / 1e9).toFixed(3)})`);
 if (balance < need && mode !== "build") {
   // build mode lets the wallet itself refuse; the others stop here
   fail(`wallet holds ${(balance / 1e9).toFixed(3)} SOL, this needs about ${(need / 1e9).toFixed(3)} with rent and a 0.02 reserve`, { plan: summary });
@@ -171,11 +174,13 @@ if (mode === "dry-run" || mode === "build") {
 // block the next one, and what did not open is reported with everything needed to open it again.
 const results = [], failedSlices = [];
 let strikes = 0;
+progress(`buka ${plan.slices.length} slice · ◎${(Number(plan.slices.reduce((a, s) => a + BigInt(s.lamports), 0n)) / 1e9).toFixed(3)}`);
 for (const [i, s] of plan.slices.entries()) {
   const r = { slice: i + 1, lo: s.lo, hi: s.hi, sol: Number(s.lamports) / 1e9, ...(s.width > 70 ? { extended: s.width } : {}) };
   results.push(r);
   let done = false, lastErr = null;
   for (let attempt = 1; attempt <= 3 && !done; attempt++) {
+    progress(`slice ${i + 1}/${plan.slices.length}: ◎${(Number(s.lamports) / 1e9).toFixed(3)} bin ${s.lo}..${s.hi}${attempt > 1 ? ` · coba lagi (${attempt}/3)` : ""}`);
     const posKp = Keypair.generate();
     let created = false, sigs = [], txs = [];
     try {
@@ -211,9 +216,11 @@ for (const [i, s] of plan.slices.entries()) {
       }
       r.signature = sigs[sigs.length - 1]; r.signatures = sigs; r.ok = true; r.attempts = attempt;
       done = true;
+      progress(`✓ slice ${i + 1}/${plan.slices.length} kebuka`, { ok: true });
     } catch (e) {
       lastErr = e;
       r.error = errText(e);
+      progress(`✗ slice ${i + 1}/${plan.slices.length}: ${String(r.error).slice(0, 140)}`, { ok: false });
       // The create may have landed although the send reported an error: never open the slice a second time.
       if (!created && r.position && (await connection.getAccountInfo(posKp.publicKey, "confirmed").catch(() => null))) {
         created = true;

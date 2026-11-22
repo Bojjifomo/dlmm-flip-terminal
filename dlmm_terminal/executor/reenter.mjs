@@ -15,6 +15,7 @@ import path from "node:path";
 import { loadSigner } from "./keys.mjs";
 import { tradeConnection, rpcStats } from "./rpc.mjs";
 import { sellToSol } from "./swap.mjs";
+import { progress } from "./progress.mjs";
 import { guardMain } from "./txutil.mjs";
 
 const require = createRequire(import.meta.url);
@@ -30,7 +31,8 @@ const fail = (error, extra) => { out({ ok: false, error, ...(extra || {}) }); pr
 guardMain(out);
 const lastJson = s => { const l = s.trim().split("\n").reverse().find(x => x.startsWith("{")); return l ? JSON.parse(l) : null; };
 function child(script, args) {
-  try { return lastJson(execFileSync("node", [path.join(here, script), ...args], { encoding: "utf8", maxBuffer: 1e8, env: process.env })); }
+  // stderr passes through, so the child's "@@" progress lines reach DLMM Web's activity panel too
+  try { return lastJson(execFileSync("node", [path.join(here, script), ...args], { encoding: "utf8", maxBuffer: 1e8, env: process.env, stdio: ["ignore", "pipe", "inherit"] })); }
   catch (e) { return lastJson(String(e.stdout || "")) || { ok: false, error: String(e.stderr || e.message).slice(-300) }; }
 }
 
@@ -88,8 +90,11 @@ if (dry) {
 const solBefore = await connection.getBalance(owner);
 const tokBefore = await tokenBalance();
 const closed = gone.map(p => ({ position: p, ok: true, alreadyClosed: true }));
-for (const { position: p } of view) {
+progress(`close ${view.length} slice${view.length > 1 ? "s" : ""}${reopen ? " → jual token → buka lagi" : " → jual token"}`);
+for (const [ci, { position: p }] of view.entries()) {
+  progress(`close slice ${ci + 1}/${view.length} (${p.slice(0, 6)}…)`);
   const r = child("close_position.mjs", ["--pool", pool, "--position", p]);
+  progress(r?.ok ? `✓ slice ${ci + 1}/${view.length} ditutup` : `✗ slice ${ci + 1}/${view.length} gagal ditutup: ${String(r?.error || "?").slice(0, 120)}`, { ok: !!r?.ok });
   closed.push({ position: p, ok: !!r?.ok, error: r?.error });
   if (!r?.ok) { out({ ok: false, step: "close", error: `close ${p} failed: ${r?.error || "?"}`, closed }); process.exit(1); }
 }
@@ -97,6 +102,7 @@ for (const { position: p } of view) {
 // seconds, so wait until it moves (up to ~30 s) when the positions held some token; if it never
 // shows, sell what the positions held, capped by what the wallet now holds.
 const expected = BigInt(Math.floor(view.reduce((a, v) => a + (Number(v.tokenRaw) || 0), 0)));
+if (expected > 0n) progress("nunggu token hasil close masuk ke wallet…");
 let tokAfter = await tokenBalance(), gained = tokAfter.raw - tokBefore.raw, waited = 0;
 while (expected > 0n && gained * 100n < expected * 95n && waited < 15) {
   await new Promise(r => setTimeout(r, 2000));
@@ -117,6 +123,7 @@ if (gone.length && tokAfter.raw > gained) {
 }
 let swap = null, swapError = null;
 if (gained > 0n) {
+  progress(`jual token ke SOL…`);
   // Jupiter, else straight into this pool; never more than --maxloss % under the pool price.
   const res = await sellToSol(tokenMint, gained.toString(), { connection, signer, owner, maxLossPct: maxLoss, pool });
   if (!res.ok) {
@@ -130,12 +137,31 @@ if (gained > 0n) {
     swap = { ok: false, error: res.error, tried: res.tried, leftover: { mint: tokenMint, pool, raw: gained.toString() } };
   } else {
     swap = { ok: true, signature: res.signature, via: res.via, tokenRaw: gained.toString(), sol: res.sol, underPct: res.underPct, note: gainedNote, waitedS: waited * 2 };
+    // Token of a slice whose close the RPC reported late (Singularity, 22 Nov: the third slice's 11.7k landed in
+    // the balance after the sale had started, and stayed in the wallet). Look again and sell what is left of
+    // this ladder's token (never what was in the wallet before the close).
+    for (let k = 0; k < 3; k++) {
+      await new Promise(r => setTimeout(r, 4000));
+      const extra = (await tokenBalance()).raw - tokBefore.raw;
+      if (extra <= 0n) break;
+      progress(`sisa token (${extra}) telat masuk: jual juga…`);
+      const r2 = await sellToSol(tokenMint, extra.toString(), { connection, signer, owner, maxLossPct: maxLoss, pool });
+      if (!r2.ok) {
+        swapError = `sisa token NOT sold: ${r2.error}. It stays in the wallet (Cleanup sells it later).`;
+        swap.leftover = { mint: tokenMint, pool, raw: extra.toString() };
+        break;
+      }
+      swap.sol = (Number(swap.sol) || 0) + (Number(r2.sol) || 0);
+      swap.tokenRaw = (BigInt(swap.tokenRaw) + extra).toString();
+      swap.extraSales = (swap.extraSales || 0) + 1;
+    }
   }
 }
 // What came back. The RPC can still show the balance from before the close / sale for a few
 // seconds: wait (up to ~30 s) until it shows at least 90% of what the positions held in SOL plus
 // what the sale paid, so the re-open is not refused (or made smaller) on a stale read.
 const expectSol = view.reduce((a, v) => a + (Number(v.solLamports) || 0), 0) / 1e9 + (swap && swap.ok ? Number(swap.sol) || 0 : 0);
+progress("nunggu SOL kebaca di wallet…");
 let solAfter = await connection.getBalance(owner), balWait = 0;
 while ((solAfter - solBefore) / 1e9 < expectSol * 0.9 && balWait < 15) {
   await new Promise(r => setTimeout(r, 2000));
@@ -152,6 +178,7 @@ const rentBack = view.length * 0.0419;               // rent of the slices close
 const own = Math.min(back - rentBack, expectSol);
 const ask = arg("sol") ? Number(arg("sol")) : Math.floor(own * 0.999 * 1000) / 1000;
 if (!(ask >= 0.01)) { out({ ok: false, step: "reopen", error: `only ${back.toFixed(4)} SOL came back (expected ~${expectSol.toFixed(3)}, waited ${balWait * 2}s): too small to re-open. The SOL is in the wallet.${swapError ? " Also: " + swapError : ""}`, closed, swap, solBack: back }); process.exit(1); }
+progress(`buka ladder lagi: ◎${ask} · ${arg("slices", "5")} slice sampai −${arg("bottom", "70")}%`);
 const opened = child("open_ladder.mjs", ["--pool", pool, "--sol", String(ask), "--slices", arg("slices", "5"), "--bottom", arg("bottom", "70"),
   "--top", arg("top", "0"), "--strategy", arg("strategy", "spot")]);
 const landed = (opened?.results || []).filter(x => x && x.ok).length;

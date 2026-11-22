@@ -516,8 +516,11 @@ const trade = {
       this.pin = p;
     }
     try {
-      return await getJson(url, { method: "POST", headers: { "Content-Type": "application/json", "X-DLMM-Trade": "1" },
-        body: JSON.stringify(Object.assign({}, body, { pin: this.pin })) }, 600000);
+      // trades run as a server job: the 📡 activity panel shows every step live, and the result comes back when done
+      const isTrade = url.startsWith("/api/trade/");
+      const r = await getJson(url, { method: "POST", headers: { "Content-Type": "application/json", "X-DLMM-Trade": "1" },
+        body: JSON.stringify(Object.assign({}, body, { pin: this.pin }, isTrade ? { async: true } : {})) }, 600000);
+      return r && r.jobId ? await followJob(r.jobId, r.title) : r;
     } catch (e) {
       if (/PIN/.test(e.message)) this.pin = null;
       throw e;
@@ -1229,6 +1232,68 @@ async function openReview() {
   };
   poll();
 }
+
+// ---------- 📡 live activity: close / swap / re-entry / open, step by step ----------
+const act = { jobs: [], open: true, timer: null };
+function actPanel() {
+  let el = document.getElementById("activity");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "activity";
+    el.className = "activity hidden";
+    document.body.appendChild(el);
+    el.addEventListener("click", e => {
+      if (e.target.closest("[data-acttoggle]")) { act.open = !act.open; paintActivity(); }
+      if (e.target.closest("[data-actclose]")) { act.jobs = act.jobs.filter(j => !j.done); paintActivity(); }
+    });
+  }
+  return el;
+}
+function paintActivity() {
+  const el = actPanel();
+  const jobs = act.jobs.slice(0, 6);
+  el.classList.toggle("hidden", !jobs.length);
+  if (!jobs.length) return;
+  const running = jobs.filter(j => !j.done).length;
+  const secs = j => Math.round(((j.done ? j.t1 : Date.now() / 1000) - j.t0));
+  el.innerHTML = `<div class="acthead"><b>📡 Aktivitas</b> <span class="muted">${running ? `${running} jalan` : "selesai"}</span><span class="spacer"></span>
+      ${running ? "" : '<button class="linkbtn" data-actclose>hapus</button>'}<button class="linkbtn" data-acttoggle>${act.open ? "▾" : "▸"}</button></div>` +
+    (act.open ? jobs.map(j => {
+      const st = j.done ? (j.ok ? '<span class="pos">✓</span>' : '<span class="neg">✗</span>') : '<span class="spin">⏳</span>';
+      const steps = (j.steps || []).slice(-8).map(x => `<div class="actstep ${x.ok === false ? "neg" : x.ok ? "pos" : ""}">${esc(x.msg)}</div>`).join("");
+      const err = j.done && !j.ok && (j.error || (j.result && j.result.error)) ? `<div class="actstep neg">${esc(String(j.error || j.result.error).slice(0, 220))}</div>` : "";
+      return `<div class="actjob">${st} <b>${esc(j.title)}</b> <span class="muted">${j.kind === "auto" ? "auto · " : ""}${secs(j)}s</span>${steps}${err}</div>`;
+    }).join("") : "");
+}
+function upsertJob(j) {
+  const i = act.jobs.findIndex(x => x.id === j.id);
+  if (i >= 0) act.jobs[i] = j; else act.jobs.unshift(j);
+  act.jobs.sort((a, b) => b.t0 - a.t0);
+  paintActivity();
+}
+async function followJob(id, title) {
+  upsertJob({ id, title, t0: Date.now() / 1000, steps: [{ msg: "mulai…" }], done: false, kind: "manual" });
+  for (let i = 0; i < 1800; i++) {               // up to ~45 min
+    await new Promise(r => setTimeout(r, 1500));
+    let r;
+    try { r = await getJson(`/api/job?id=${id}`, null, 15000); } catch (e) { continue; }
+    if (!r.ok) throw new Error(r.error || "job hilang");
+    upsertJob(r.job);
+    if (r.job.done) { setTimeout(() => { if (state.wallet) loadPortfolio(); }, 2000); return r.job.result; }
+  }
+  throw new Error("job kelamaan: cek Portfolio");
+}
+// auto jobs (auto exit, auto re-entry, flip) appear on their own
+async function pollJobs() {
+  try {
+    const r = await getJson("/api/jobs", null, 10000);
+    const fresh = (r.jobs || []).filter(j => j.kind === "auto" && (!j.done || Date.now() / 1000 - (j.t1 || 0) < 600));
+    for (const j of fresh) upsertJob(j);
+  } catch (e) {}
+  const busy = act.jobs.some(j => !j.done);
+  setTimeout(pollJobs, busy ? 2000 : 15000);
+}
+setTimeout(pollJobs, 3000);
 const closeModal = () => { $("#modal").classList.add("hidden"); $("#modalCard").classList.remove("wide"); };
 $("#modal").addEventListener("click", e => { if (e.target.id === "modal") closeModal(); });
 document.addEventListener("keydown", e => {

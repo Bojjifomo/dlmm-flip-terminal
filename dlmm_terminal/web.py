@@ -546,8 +546,12 @@ def auto_exit_once(cfg: dict, wallet: str) -> list[dict]:
         if not hit:
             continue
         notify(f"🎯 AUTO EXIT {g['symbol']}: PnL {g['pnlPct']:+.2f}% ≥ +{a['pct']:g}% → close + swap {len(g['positions'])} slice")
-        res = node.run("reenter.mjs", ["--pool", pool, "--positions", ",".join(g["positions"]),
-                                       "--maxloss", str(cfg["trade"]["maxLossPct"])], timeout=900)
+        job = node.job_start(f"Auto exit {g['symbol']} (TP +{a['pct']:g}%)", "auto")
+        with node.job_context(job):
+            node.job_step(f"PnL {g['pnlPct']:+.2f}% ≥ +{a['pct']:g}%")
+            res = node.run("reenter.mjs", ["--pool", pool, "--positions", ",".join(g["positions"]),
+                                           "--maxloss", str(cfg["trade"]["maxLossPct"])], timeout=900)
+        node.job_finish(job, res)
         ok = bool(res.get("ok"))
         sw = res.get("swap") or {}
         left = res.get("leftover")
@@ -628,7 +632,13 @@ def flip_run(cfg: dict, pool: str, position: str, to: str, symbol: str = "", for
             "--slippage", str(float(fc["slippagePct"])), "--reserve", str(float(fc["minSolReserve"]))]
     if force:
         args.append("--force")
-    res = node.run("flip.mjs", args, timeout=600)
+    if getattr(node._tls, "job", None) is None:                  # auto flips get their own activity entry
+        job = node.job_start(f"Flip {symbol or pool[:6]} → {to}", "auto" if source == "auto" else "manual")
+        with node.job_context(job):
+            res = node.run("flip.mjs", args, timeout=600)
+        node.job_finish(job, res)
+    else:
+        res = node.run("flip.mjs", args, timeout=600)
     ok = bool(res.get("ok"))
     with _auto_lock:
         d = flip_load()
@@ -800,10 +810,14 @@ def reentry_once(cfg: dict, wallet: str) -> list[dict]:
                     d["pools"][pool].update(status="armed", msg="nunggu re-entry lain selesai")
                     reentry_save(d)
             continue
+        job = node.job_start(f"Auto re-entry {sym}", "auto")
         try:
-            res = node.run("reenter.mjs", args, timeout=1500)
+            with node.job_context(job):
+                node.job_step(dec.msg)
+                res = node.run("reenter.mjs", args, timeout=1500)
         finally:
             _reenter_lock.release()
+        node.job_finish(job, res)
         ok = bool(res.get("ok"))
         msg = (f"re-entry ◎{res.get('reopenSol')} · {pl['slices']} slice" if ok
                else f"{res.get('step') or ''} {res.get('error') or 'gagal'}")[:220]
@@ -882,6 +896,86 @@ def portfolio(wallet: str, cfg: dict) -> dict:
             "autoExitCheckMin": (cfg.get("web") or {}).get("autoExitCheckMin", 2)}
 
 
+
+def _trade_title(path: str, body: dict) -> str:
+    sym = body.get("symbol") or (str(body.get("pool") or body.get("mint") or "")[:6] + "…")
+    if path.endswith("open"):
+        return f"Buka ladder {sym} ◎{body.get('sol')}" + (" (slice yang belum kebuka)" if body.get("retrySlices") else "")
+    if path.endswith("reenter"):
+        return f"{'Re-entry' if body.get('reopen') else 'Close+swap'} {sym}"
+    if path.endswith("sell"):
+        return f"Jual {sym} ke SOL"
+    if path.endswith("cleanup"):
+        return "Cleanup wallet"
+    if path.endswith("flip"):
+        return f"Flip {sym} → {body.get('to')}"
+    return f"Close {sym}"
+
+
+def _trade_exec(path: str, cfg: dict, body: dict) -> dict:
+    """What /api/trade/* does (open, flip, sell, cleanup, reenter, close): returns the executor's result."""
+    from .cli import append
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if path.endswith("open"):
+        pos = cfg["position"]
+        retry = body.get("retrySlices")
+        sol = float(body.get("sol") or 0.01) if retry else float(body["sol"])
+        args = node.ladder_args(str(body["pool"]), sol, int(body.get("slices") or pos.get("ladderSlices", 5)),
+                                abs(float(body.get("bottom") or pos["rangeBottomPct"])), float(body.get("top") or 0),
+                                str(body.get("strategy") or "spot"))
+        if retry:
+            # open exactly the slices an earlier run did not manage, at their old bin ranges
+            args += ["--retry-slices", json.dumps([{"lo": int(x["lo"]), "hi": int(x["hi"]), "lamports": str(int(x["lamports"]))} for x in retry])]
+        res = node.run("open_ladder.mjs", args, timeout=900)
+        from .cli import DATA
+        append("opens.jsonl", {"ts": ts, "pool": body.get("pool"), "symbol": body.get("symbol"), "retry": bool(retry),
+                               "ok": res.get("ok"), "error": res.get("error"), "results": res.get("results"),
+                               "failedSlices": res.get("failedSlices")})
+        append("decisions.jsonl", {"ts": ts, "source": "web", "pool": body.get("pool"), "symbol": body.get("symbol"),
+                                   "decision": "enter", "sizeSol": sol, "override": bool(body.get("override")),
+                                   "positions": [r.get("position") for r in res.get("results", [])], "ok": res.get("ok"),
+                                   "error": res.get("error")})
+        return res
+    if path.endswith("/flip"):
+        to = str(body["to"])
+        if to not in ("ask", "bid"):
+            return {"ok": False, "error": "to: ask | bid"}
+        return (flip_run(cfg, str(body["pool"]), str(body["position"]), to, str(body.get("symbol") or ""),
+                                   force=bool(body.get("force")), source="web"))
+    if path.endswith("/sell"):
+        args = ["--mint", str(body["mint"]), "--maxloss", str(float(body.get("maxloss") or cfg["trade"]["maxLossPct"]))]
+        if body.get("pool"):
+            args += ["--pool", str(body["pool"])]
+        res = node.run("sell.mjs", args, timeout=300)
+        append("closes.jsonl", {"ts": ts, "source": "web", "rule": "sell", "mint": body.get("mint"),
+                                **{k: res.get(k) for k in ("ok", "error", "via", "sol", "signature")}})
+        return res
+    if path.endswith("cleanup"):
+        res = node.run("cleanup.mjs", ["--maxloss", str(float(body.get("maxloss") or cfg["trade"]["maxLossPct"]))], timeout=600)
+        append("closes.jsonl", {"ts": ts, "source": "web", "rule": "cleanup", **{k: res.get(k) for k in ("ok", "error", "emptyAccounts", "closed", "left")}})
+        return res
+    if path.endswith("reenter"):
+        pos = cfg["position"]
+        positions = [str(x) for x in body["positions"]]
+        args = ["--pool", str(body["pool"]), "--positions", ",".join(positions), "--maxloss", str(float(body.get("maxloss") or cfg["trade"]["maxLossPct"]))]
+        if body.get("reopen"):
+            args += ["--reopen", "--slices", str(int(body.get("slices") or len(positions) or pos.get("ladderSlices", 5))),
+                     "--bottom", str(abs(float(body.get("bottom") or pos["rangeBottomPct"]))), "--top", str(float(body.get("top") or 0)),
+                     "--strategy", str(body.get("strategy") or pos.get("strategy") or "spot").lower()]
+        if not _reenter_lock.acquire(blocking=False):
+            return {"ok": False, "step": "busy", "error": "re-entry / close+swap lain lagi jalan: tunggu selesai dulu (biar SOL-nya nggak ketuker antar ladder)"}
+        try:
+            res = node.run("reenter.mjs", args, timeout=1500)
+        finally:
+            _reenter_lock.release()
+        append("closes.jsonl", {"ts": ts, "source": "web", "pool": body.get("pool"), "symbol": body.get("symbol"),
+                                "positions": positions, "rule": "reenter" if body.get("reopen") else "close-swap", **{k: res.get(k) for k in ("ok", "error", "step", "solBack", "reopenSol")}})
+        return res
+    res = node.run("close_position.mjs", ["--pool", str(body["pool"]), "--position", str(body["position"])], timeout=300)
+    append("closes.jsonl", {"ts": ts, "source": "web", "pool": body.get("pool"), "symbol": body.get("symbol"),
+                            "position": body.get("position"), "rule": body.get("rule"), **res})
+    return res
+
 class Handler(BaseHTTPRequestHandler):
     cfg: dict = {}
 
@@ -921,6 +1015,11 @@ class Handler(BaseHTTPRequestHandler):
                 if last and last.get("entries") is not None:
                     last = {**{k: last[k] for k in ("t", "wallet", "days") if k in last}, **review.summarize(last["entries"], self.cfg)}
                 return self._json({**st, "last": last})
+            if u.path == "/api/jobs":
+                return self._json({"ok": True, "jobs": node.jobs_view()})
+            if u.path == "/api/job":
+                j = node.JOBS.get(q.get("id") or "")
+                return self._json({"ok": bool(j), "job": j, **({} if j else {"error": "job nggak ketemu (server restart?)"})})
             if u.path == "/api/narrative":
                 hit = narrative.cached(q.get("mint") or "")
                 return self._json({"ok": True, "result": hit, "claudeCode": bool(narrative.find_claude())})
@@ -1005,66 +1104,25 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": why}, 403)
                 if not node.trade_wallet().get("ok"):
                     return self._json({"ok": False, "error": "belum ada key: isi DLMM_PRIVATE_KEY di .env lalu start ulang"}, 400)
-                from .cli import append
-                ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                if self.path.endswith("open"):
-                    pos = self.cfg["position"]
-                    retry = body.get("retrySlices")
-                    sol = float(body.get("sol") or 0.01) if retry else float(body["sol"])
-                    args = node.ladder_args(str(body["pool"]), sol, int(body.get("slices") or pos.get("ladderSlices", 5)),
-                                            abs(float(body.get("bottom") or pos["rangeBottomPct"])), float(body.get("top") or 0),
-                                            str(body.get("strategy") or "spot"))
-                    if retry:
-                        # open exactly the slices an earlier run did not manage, at their old bin ranges
-                        args += ["--retry-slices", json.dumps([{"lo": int(x["lo"]), "hi": int(x["hi"]), "lamports": str(int(x["lamports"]))} for x in retry])]
-                    res = node.run("open_ladder.mjs", args, timeout=900)
-                    from .cli import DATA
-                    append("opens.jsonl", {"ts": ts, "pool": body.get("pool"), "symbol": body.get("symbol"), "retry": bool(retry),
-                                           "ok": res.get("ok"), "error": res.get("error"), "results": res.get("results"),
-                                           "failedSlices": res.get("failedSlices")})
-                    append("decisions.jsonl", {"ts": ts, "source": "web", "pool": body.get("pool"), "symbol": body.get("symbol"),
-                                               "decision": "enter", "sizeSol": sol, "override": bool(body.get("override")),
-                                               "positions": [r.get("position") for r in res.get("results", [])], "ok": res.get("ok"),
-                                               "error": res.get("error")})
-                    return self._json(res)
-                if self.path.endswith("/flip"):
-                    to = str(body["to"])
-                    if to not in ("ask", "bid"):
-                        return self._json({"ok": False, "error": "to: ask | bid"}, 400)
-                    return self._json(flip_run(self.cfg, str(body["pool"]), str(body["position"]), to, str(body.get("symbol") or ""),
-                                               force=bool(body.get("force")), source="web"))
-                if self.path.endswith("/sell"):
-                    args = ["--mint", str(body["mint"]), "--maxloss", str(float(body.get("maxloss") or self.cfg["trade"]["maxLossPct"]))]
-                    if body.get("pool"):
-                        args += ["--pool", str(body["pool"])]
-                    res = node.run("sell.mjs", args, timeout=300)
-                    append("closes.jsonl", {"ts": ts, "source": "web", "rule": "sell", "mint": body.get("mint"),
-                                            **{k: res.get(k) for k in ("ok", "error", "via", "sol", "signature")}})
-                    return self._json(res)
-                if self.path.endswith("cleanup"):
-                    res = node.run("cleanup.mjs", ["--maxloss", str(float(body.get("maxloss") or self.cfg["trade"]["maxLossPct"]))], timeout=600)
-                    append("closes.jsonl", {"ts": ts, "source": "web", "rule": "cleanup", **{k: res.get(k) for k in ("ok", "error", "emptyAccounts", "closed", "left")}})
-                    return self._json(res)
-                if self.path.endswith("reenter"):
-                    pos = self.cfg["position"]
-                    positions = [str(x) for x in body["positions"]]
-                    args = ["--pool", str(body["pool"]), "--positions", ",".join(positions), "--maxloss", str(float(body.get("maxloss") or self.cfg["trade"]["maxLossPct"]))]
-                    if body.get("reopen"):
-                        args += ["--reopen", "--slices", str(int(body.get("slices") or len(positions) or pos.get("ladderSlices", 5))),
-                                 "--bottom", str(abs(float(body.get("bottom") or pos["rangeBottomPct"]))), "--top", str(float(body.get("top") or 0)),
-                                 "--strategy", str(body.get("strategy") or pos.get("strategy") or "spot").lower()]
-                    if not _reenter_lock.acquire(blocking=False):
-                        return self._json({"ok": False, "step": "busy", "error": "re-entry / close+swap lain lagi jalan: tunggu selesai dulu (biar SOL-nya nggak ketuker antar ladder)"})
-                    try:
-                        res = node.run("reenter.mjs", args, timeout=1500)
-                    finally:
-                        _reenter_lock.release()
-                    append("closes.jsonl", {"ts": ts, "source": "web", "pool": body.get("pool"), "symbol": body.get("symbol"),
-                                            "positions": positions, "rule": "reenter" if body.get("reopen") else "close-swap", **{k: res.get(k) for k in ("ok", "error", "step", "solBack", "reopenSol")}})
-                    return self._json(res)
-                res = node.run("close_position.mjs", ["--pool", str(body["pool"]), "--position", str(body["position"])], timeout=300)
-                append("closes.jsonl", {"ts": ts, "source": "web", "pool": body.get("pool"), "symbol": body.get("symbol"),
-                                        "position": body.get("position"), "rule": body.get("rule"), **res})
+                title = _trade_title(self.path, body)
+                if body.get("async"):
+                    # run in the background as a job; the page follows its steps (/api/job) in the 📡 activity panel
+                    job = node.job_start(title)
+                    path, cfg = self.path, self.cfg
+
+                    def work():
+                        with node.job_context(job):
+                            try:
+                                res = _trade_exec(path, cfg, body)
+                            except Exception as exc:
+                                res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                            node.job_finish(job, res)
+                    threading.Thread(target=work, daemon=True).start()
+                    return self._json({"ok": True, "jobId": job["id"], "title": title})
+                job = node.job_start(title)
+                with node.job_context(job):
+                    res = _trade_exec(self.path, self.cfg, body)
+                node.job_finish(job, res)
                 return self._json(res)
             if self.path == "/api/review":
                 # read-only analysis (Meteora API, no key, no RPC): the trade header against other sites, no PIN

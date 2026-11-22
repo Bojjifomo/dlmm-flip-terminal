@@ -311,3 +311,14 @@ tbody tr.sibrow td:first-child { box-shadow: inset 3px 0 0 #275a88; }
 .narr .narrtext { line-height: 1.5; }
 .narr .narrsrc { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; font-size: 11px; }
 .narr .narrsrc a { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 📡 live activity */
+.activity { position: fixed; right: 14px; bottom: 14px; z-index: 30; width: 380px; max-height: 60vh; overflow-y: auto;
+  background: #0b0e12; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 24px rgba(0,0,0,.5); }
+.activity .acthead { display: flex; gap: 6px; align-items: center; margin-bottom: 4px; }
+.activity .actjob { padding: 6px 0; border-top: 1px solid var(--line); }
+.activity .actstep { padding-left: 18px; color: var(--muted); line-height: 1.45; }
+.activity .actstep.pos { color: #3ddc84; } .activity .actstep.neg { color: #ff5a5f; }
+.activity .spin { display: inline-block; animation: actspin 1.2s linear infinite; }
+@keyframes actspin { to { transform: rotate(360deg); } }
+@media (max-width: 640px) { .activity { left: 8px; right: 8px; width: auto; bottom: calc(64px + env(safe-area-inset-bottom)); max-height: 45vh; } }
