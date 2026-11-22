@@ -146,12 +146,16 @@ const back = (solAfter - solBefore) / 1e9;                       // SOL + return
 if (!reopen) { out({ ok: true, mode: "close-swap", closed, swap, solBack: back, tokenMint, expectedTokenRaw: expected.toString() }); process.exit(0); }
 
 const rentBack = view.length * 0.0419;               // rent of the slices closed here (not ones closed earlier)
-const ask = arg("sol") ? Number(arg("sol")) : Math.floor((back - rentBack) * 0.999 * 1000) / 1000;
+// Re-open with what THIS ladder held (its SOL + what its token sold for), never more: the wallet balance can
+// also move because something else ran at the same time (another re-entry, an auto exit, a sale), and that SOL
+// is not this ladder's. Fees and the old rent stay in the wallet. The balance only caps it from above.
+const own = Math.min(back - rentBack, expectSol);
+const ask = arg("sol") ? Number(arg("sol")) : Math.floor(own * 0.999 * 1000) / 1000;
 if (!(ask >= 0.01)) { out({ ok: false, step: "reopen", error: `only ${back.toFixed(4)} SOL came back (expected ~${expectSol.toFixed(3)}, waited ${balWait * 2}s): too small to re-open. The SOL is in the wallet.${swapError ? " Also: " + swapError : ""}`, closed, swap, solBack: back }); process.exit(1); }
 const opened = child("open_ladder.mjs", ["--pool", pool, "--sol", String(ask), "--slices", arg("slices", "5"), "--bottom", arg("bottom", "70"),
   "--top", arg("top", "0"), "--strategy", arg("strategy", "spot")]);
 const landed = (opened?.results || []).filter(x => x && x.ok).length;
-out({ ok: !!opened?.ok, mode: "reenter", closed, swap, swapError, solBack: back, reopenSol: ask, opened, landedSlices: landed,
+out({ ok: !!opened?.ok, mode: "reenter", closed, swap, swapError, solBack: back, ladderSol: +expectSol.toFixed(4), reopenSol: ask, opened, landedSlices: landed,
   ...(opened?.ok ? {} : { step: "reopen", error: (landed ? `re-opened ${landed} slice(s) only: ` : "re-open failed, the SOL is in the wallet: ") + (opened?.error || "?") }),
   ...(opened?.ok && swapError ? { warning: swapError } : {}) });
 process.exit(opened?.ok ? 0 : 1);
