@@ -67,7 +67,6 @@ def dex_5m(ids: list[str]) -> dict:
                 "buys5m": tx5.get("buys"), "sells5m": tx5.get("sells"),
                 "boost": (p.get("boosts") or {}).get("active") or 0,
                 "fdv": p.get("fdv"), "dsUrl": p.get("url"),
-                "chg": {"1h": pc.get("h1"), "6h": pc.get("h6"), "24h": pc.get("h24")},
             }
     return out
 
