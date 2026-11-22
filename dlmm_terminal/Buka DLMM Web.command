@@ -45,9 +45,16 @@ URL="http://localhost:$PORT"
 PID=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1)
 if [ -n "$PID" ]; then
   CMD=$(ps -p "$PID" -o command= 2>/dev/null)
-  if echo "$CMD" | grep -q "dlmm_terminal web"; then
+  # Any DLMM Web: "python3 -m dlmm_terminal web" (this one) or an older copy run as a folder,
+  # e.g. "python …/Projects/src/dlmm-terminal web" or "…/Capstone1/dlmm_terminal web".
+  if echo "$CMD" | grep -Eq 'dlmm[-_]terminal[^ ]* web( |$)'; then
     RUNDIR=$(lsof -a -p "$PID" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
-    if [ -n "$RUNDIR" ] && [ "$(cd "$RUNDIR" 2>/dev/null && pwd -P)" != "$(pwd -P)" ]; then
+    HERE=$(pwd -P)
+    SAME=0
+    if echo "$CMD" | grep -q -- "-m dlmm_terminal web" && [ -n "$RUNDIR" ] && [ "$(cd "$RUNDIR" 2>/dev/null && pwd -P)" = "$HERE" ]; then SAME=1; fi
+    if [ "$SAME" = 0 ]; then
+      RUNDIR=${RUNDIR:-?}
+      echo "$CMD" | grep -q -- "-m dlmm_terminal" || RUNDIR=$(echo "$CMD" | grep -Eo '/[^ ]*dlmm[-_]terminal[^ ]*' | tail -1)
       # An older copy (another folder) is serving: its code is not this one. Offer to stop it.
       echo ""
       echo "DLMM Web versi lama lagi jalan dari: $RUNDIR"
