@@ -148,11 +148,27 @@ async function getJson(url, opt, timeoutMs) {
   if (!r.ok) throw new Error(j.error || r.status);
   return j;
 }
+// 🎯 PICK: a browser notification when a pool newly enters the list (the server sends Telegram).
+function notifyNewPicks(rows) {
+  const now = rows.filter(r => r.pick).map(r => r.pool);
+  let seen = null;
+  try { seen = JSON.parse(localStorage.getItem("dlmm.pickSeen") || "null"); } catch (e) {}
+  if (seen) {
+    const fresh = rows.filter(r => r.pick && !seen.includes(r.pool));
+    if (fresh.length) {
+      const txt = fresh.slice(0, 5).map(r => `${r.symbol} (vol/mcap ${(r.volMcap24h || 0).toFixed(2)}x)`).join(", ");
+      notify(`🎯 PICK baru: ${fresh.length}`, txt);
+      toast(`🎯 PICK baru: ${txt}`);
+    }
+  }
+  try { localStorage.setItem("dlmm.pickSeen", JSON.stringify(now)); } catch (e) {}
+}
 async function loadPools(force) {
   const tvl = $("#tvl").value;
   try {
     state.data = await getJson(`/api/pools?tvl=${tvl}${force ? "&force=1" : ""}`);
     state.loadedAt = Date.now();
+    notifyNewPicks(state.data.rows);
     renderTop();
     renderPools();
     if (state.pf) renderPortfolio();
@@ -223,6 +239,11 @@ function rowsView() {
     return ((state.ping && state.ping.rows) || []).map(p => d.rows.find(r => r.pool === p.pool)).filter(Boolean)
       .filter(r => !q || `${r.symbol} ${r.name} ${r.pool} ${r.tokenMint}`.toLowerCase().includes(q));
   }
+  if (m === "pick") {
+    // 🎯 PICK: the review filter, best 24h vol/mcap first (1-3x made the most in the review)
+    return d.rows.filter(r => r.pick && (!q || `${r.symbol} ${r.name} ${r.pool} ${r.tokenMint}`.toLowerCase().includes(q)))
+      .sort((a, b) => (b.volMcap24h || 0) - (a.volMcap24h || 0));
+  }
   let rows = d.rows.filter(r => {
     if (m === "pass" && !["OPEN", "CAREFUL"].includes(r.verdict.level)) return false;
     if (m === "watch" && !watched(r.pool)) return false;
@@ -280,9 +301,19 @@ function ladderLabel() {
 }
 function renderPingInfo() {
   const el = $("#pingInfo"), p = state.ping;
-  el.classList.toggle("hidden", state.mode !== "ping");
+  el.classList.toggle("hidden", state.mode !== "ping" && state.mode !== "pick");
   $("#nPing").textContent = p && p.rows ? p.rows.length : "";
   $("#nWatch").textContent = state.watch.length || "";
+  const nPick = state.data ? state.data.rows.filter(r => r.pick).length : 0;
+  $("#nPick").textContent = nPick || "";
+  if (state.mode === "pick") {
+    const g = (state.cfg && state.cfg.cfg) || {}, gt = g.gates || {}, fl = g.flags || {};
+    const band = fl.volMcapBand || [0.3, 3];
+    el.innerHTML = `<span>🎯 <b>PICK</b> = filter dari review wallet lu: semua gate lolos (fee APR, umur, harga 1h ≤ +${gt.maxPriceChg1hPct ?? 5}%),
+      pool ≥ ${fl.youngPoolHours ?? 6} jam, vol 24h ÷ mcap ${band[0]}–${band[1]}×, bin step ≤ ${fl.maxBinStep ?? 100}. Urut: vol ÷ mcap.
+      Flag lain (TVL tipis, drop 6h, jam malam) tetap ditampilin. Ubah angkanya di ⚙ Settings, cek hasilnya di 📊 Review.</span>`;
+    return;
+  }
   if (state.mode !== "ping") return;
   if (!p) { el.innerHTML = "📡 Scan PING… (pertama kali 20–60 detik)"; return; }
   const ago = p.t ? Math.round((Date.now() / 1000 - p.t) / 60) : null;
@@ -301,7 +332,8 @@ function renderPools() {
   $("#count").textContent = `${rows.length} of ${d.rows.length} pools · Meteora DLMM`;
   $("#poolsEmpty").classList.toggle("hidden", rows.length > 0);
   if (!rows.length) $("#poolsEmpty").textContent = state.mode === "watch" ? "Belum ada pool di watchlist: klik ☆ di pool yang mau lu mainin."
-    : state.mode === "ping" ? (state.ping && state.ping.running ? "Scan PING jalan…" : "Nggak ada pool yang lolos filter PING sekarang.") : "No pool matches the filters.";
+    : state.mode === "ping" ? (state.ping && state.ping.running ? "Scan PING jalan…" : "Nggak ada pool yang lolos filter PING sekarang.")
+    : state.mode === "pick" ? "Nggak ada pool yang lolos 🎯 PICK sekarang. Normal: filternya ketat. Cek lagi nanti (refresh tiap 15 menit), atau turunin TVL ≥." : "No pool matches the filters.";
   document.querySelectorAll("#pools th").forEach(th => th.classList.toggle("sorted", state.mode !== "ping" && th.dataset.sort === state.sort.key));
   document.querySelector("#pools th[data-sort=fees] .wl").textContent = w.toUpperCase();
   const size = d.sizeSol;
@@ -1134,7 +1166,7 @@ document.addEventListener("keydown", e => {
   if (/INPUT|SELECT|TEXTAREA/.test((e.target && e.target.tagName) || "")) return;
   if (e.key === "/") { e.preventDefault(); setView("pools"); $("#q").focus(); }        // search
   else if (e.key === "u") setUnit(state.unit === "sol" ? "usd" : "sol");                // unit
-  else if (e.key >= "1" && e.key <= "4") setMode(["all", "pass", "ping", "watch"][+e.key - 1]);
+  else if (e.key >= "1" && e.key <= "5") setMode(["all", "pass", "ping", "watch", "pick"][+e.key - 1]);
 });
 $("#stAge").onclick = () => loadPools(true);
 // The key chip: re-reads the server's config first (the server re-reads .env each time), so a key
