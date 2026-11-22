@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import api, exits, filters, flip, node, settings
+from . import api, exits, filters, flip, node, review, settings
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "web"
@@ -111,7 +111,7 @@ def _build_rows(snaps: list[dict], cfg: dict):
         fees, vol = snap.get("fees") or {}, snap.get("volume") or {}
         out.append({
             **{k: c[k] for k in ("pool", "name", "symbol", "tokenMint", "solSide", "poolAgeHours", "tvlUsd", "feeApr1h",
-                                 "feeApr24h", "volTvl24h", "mcapUsd", "priceChg1h", "priceChg6h", "priceChg24h", "binStep",
+                                 "feeApr24h", "volTvl24h", "volMcap24h", "mcapUsd", "priceChg1h", "priceChg6h", "priceChg24h", "binStep",
                                  "baseFeePct", "sizeVsTvlPct", "holders", "priceSol", "gatesFailed", "flags", "plan", "solUsd")},
             "vol24": vol.get("24h") or 0, "vol1h": vol.get("1h") or 0,
             # fees per window, and the same as % of TVL per day at that window's pace
@@ -752,6 +752,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(token_pools(self.cfg, q["mint"]))
             if u.path == "/api/pool":
                 return self._json(api.pool(q["address"]))
+            if u.path == "/api/review":
+                # Last review, re-scored against the current settings (cheap), plus whether one is running.
+                st = review.status()
+                last = st.pop("last")
+                if last and last.get("entries") is not None:
+                    last = {**{k: last[k] for k in ("t", "wallet", "days") if k in last}, **review.summarize(last["entries"], self.cfg)}
+                return self._json({**st, "last": last})
+            if u.path == "/api/pool_check":
+                # One pool against the entry rules right now (re-entry asks before re-opening).
+                rows, _, _ = _build_rows([api.pool(q["address"])], self.cfg)
+                r = rows[0]
+                return self._json({k: r.get(k) for k in ("pool", "symbol", "priceChg1h", "priceChg6h", "volMcap24h", "poolAgeHours",
+                                                         "gatesFailed", "flags", "verdict")})
             if u.path == "/api/portfolio":
                 wallet = q.get("wallet") or os.environ.get("DLMM_WALLET")
                 if not wallet:
@@ -876,7 +889,7 @@ class Handler(BaseHTTPRequestHandler):
                         args += ["--reopen", "--slices", str(int(body.get("slices") or len(positions) or pos.get("ladderSlices", 5))),
                                  "--bottom", str(abs(float(body.get("bottom") or pos["rangeBottomPct"]))), "--top", str(float(body.get("top") or 0)),
                                  "--strategy", str(body.get("strategy") or "spot")]
-                    res = node.run("reenter.mjs", args, timeout=900)
+                    res = node.run("reenter.mjs", args, timeout=1500)
                     append("closes.jsonl", {"ts": ts, "source": "web", "pool": body.get("pool"), "symbol": body.get("symbol"),
                                             "positions": positions, "rule": "reenter" if body.get("reopen") else "close-swap", **{k: res.get(k) for k in ("ok", "error", "step", "solBack", "reopenSol")}})
                     return self._json(res)
@@ -884,6 +897,15 @@ class Handler(BaseHTTPRequestHandler):
                 append("closes.jsonl", {"ts": ts, "source": "web", "pool": body.get("pool"), "symbol": body.get("symbol"),
                                         "position": body.get("position"), "rule": body.get("rule"), **res})
                 return self._json(res)
+            if self.path == "/api/review":
+                # read-only analysis (Meteora API, no key, no RPC): the trade header against other sites, no PIN
+                if self.headers.get("X-DLMM-Trade") != "1":
+                    return self._json({"ok": False, "error": "missing header"}, 403)
+                wallet = str(body.get("wallet") or os.environ.get("DLMM_WALLET") or "").strip()
+                if not wallet:
+                    return self._json({"ok": False, "error": "wallet kosong"}, 400)
+                days = max(3, min(60, float(body.get("days") or 30)))
+                return self._json(review.start(wallet, self.cfg, days))
             if self.path == "/api/prefs":
                 # display only (no money, no rules): the trade header against other sites, no PIN
                 if self.headers.get("X-DLMM-Trade") != "1":

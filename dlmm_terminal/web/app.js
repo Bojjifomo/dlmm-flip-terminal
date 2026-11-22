@@ -110,6 +110,10 @@ function nice(t) {
   if ((m = /^feeApr24h: (\d+)% < (\d+)%/.exec(t))) return `Fees thin: APR ${(+m[1]).toLocaleString()}% (min ${(+m[2]).toLocaleString()}%)`;
   if ((m = /^binStep: (.*) outside (.*)/.exec(t))) return `Bin step ${m[1]} (only ${m[2]})`;
   if (/^solQuoted/.test(t)) return "Not a SOL pair";
+  if ((m = /^pump1h: \+(-?\d+)% > \+(.*?)%/.exec(t))) return `Naik +${m[1]}% dalam 1 jam (maks +${m[2]}%): tunggu turun`;
+  if ((m = /^young pool (.*)h/.exec(t))) return `Pool muda ${m[1]} jam: fee gede tapi harga paling rawan, size kecil`;
+  if ((m = /^vol\/mcap (.*)x/.exec(t))) return `Vol 24h ÷ mcap ${m[1]}x (bagus 0.3-3x)`;
+  if ((m = /^bin step (\d+)/.exec(t))) return `Bin step ${m[1]} (di atas 100 jarang untung)`;
   if ((m = /^pump1h (.*)/.exec(t))) return `Pump 1h ${m[1]}`;
   if ((m = /^drop6h (.*)/.exec(t))) return `Drop 6h ${m[1]}`;
   if ((m = /^tvl (.*)/.exec(t))) return `Thin pool: TVL ${m[1]}`;
@@ -636,16 +640,30 @@ async function reenterPool(p, btn, reopen) {
   const group = state.pf.rows.filter(x => x.pool === p.pool);
   const slices = group.length, bottom = Math.abs(Math.min(...group.map(x => x.rangeMin)) / Math.max(...group.map(x => x.rangeMax)) * 100 - 100) || 70;
   const msg = reopen
-    ? `RE-ENTRY ${p.symbol}\n1) Close ${slices} posisi di pool ini (klaim fee)\n2) Jual sisa token ke SOL via Jupiter (batal kalau >5% di bawah harga pool)\n3) Buka ladder lagi di harga sekarang: ${slices} slice, sampai −${bottom.toFixed(0)}%, pakai semua SOL yang balik\n\nLanjut?`
+    ? `RE-ENTRY ${p.symbol}\n1) Close ${slices} posisi di pool ini (klaim fee)\n2) Jual sisa token ke SOL (batal kalau >5% di bawah harga pool; kalau gagal, tokennya ditinggal buat Cleanup)\n3) Buka ladder lagi di harga sekarang: ${slices} slice, sampai −${bottom.toFixed(0)}%, pakai semua SOL yang balik\n\nLanjut?`
     : `CLOSE + SWAP ${p.symbol}\nClose ${slices} posisi, lalu jual sisa token ke SOL via Jupiter (batal kalau >5% di bawah harga pool).\n\nLanjut?`;
-  if (!confirm(msg)) return;
+  // Re-entry opens a new ladder: the same entry rules apply (the Nov 2026 review: entering right after a
+  // +5% hour made ~0.4% vs ~2.5%). Close + swap is an exit, so it is never held back.
+  let warn = "";
+  if (reopen) {
+    try {
+      const c = await getJson(`/api/pool_check?address=${encodeURIComponent(p.pool)}`, null, 20000);
+      const gates = (c.gatesFailed || []).map(nice), flags = (c.flags || []).map(nice);
+      if (gates.length) warn += `\n\n⛔ ENTRY CHECK (${c.verdict && c.verdict.level}):\n- ${gates.join("\n- ")}`;
+      if (flags.length) warn += `\n\n⚠ ${flags.join("\n⚠ ")}`;
+      if (gates.length) warn += `\n\nSaran: Close+swap dulu, buka lagi nanti pas lolos. Tetap re-entry sekarang?`;
+    } catch (e) { warn = `\n\n(entry check nggak kebaca: ${e.message || e})`; }
+  }
+  if (!confirm(msg + warn)) return;
   btn.disabled = true;
   const cell = btn.parentElement;
   cell.insertAdjacentHTML("beforeend", '<div class="res muted" data-r>jalan… (bisa 1-3 menit)</div>');
   try {
     const s = await trade.call("/api/trade/reenter", { pool: p.pool, symbol: p.symbol, positions: group.map(x => x.position), reopen, slices, bottom });
     const r = cell.querySelector("[data-r]");
-    r.innerHTML = s.ok ? `✓ ${reopen ? `re-entry ◎${s.reopenSol}` : `closed, balik ◎${(s.solBack || 0).toFixed(3)}`}` : `✗ ${esc(s.step || "")} ${esc(s.error || "gagal")}`;
+    r.innerHTML = s.ok ? `✓ ${reopen ? `re-entry ◎${s.reopenSol}` : `closed, balik ◎${(s.solBack || 0).toFixed(3)}`}`
+        + (s.warning ? `<br><span class="neg">⚠ ${esc(s.warning)}</span>` : "")
+      : `✗ ${esc(s.step || "")} ${esc(s.error || "gagal")}` + (s.swapError && s.step !== "swap" ? `<br>⚠ ${esc(s.swapError)}` : "");
     setTimeout(loadPortfolio, 4000);
   } catch (e) {
     const r = cell.querySelector("[data-r]");
@@ -1050,6 +1068,65 @@ $("#detail").addEventListener("click", async e => {
   const c = e.target.closest("[data-copy]");
   if (c) { try { await navigator.clipboard.writeText(c.dataset.copy); c.textContent = "copied ✓"; } catch (err) {} }
 });
+
+// ---------- 📊 Review: your own ladders of the last N days (Meteora API, 0 RPC) ----------
+const CLASS_TXT = { good: "fee gede + harga nahan", priceAte: "fee kemakan harga", thin: "fee tipis" };
+const rvPc = v => (v == null ? "--" : `${v > 0 ? "+" : ""}${v.toFixed(2)}%`);
+const rvSl = v => (v == null ? "--" : `${v > 0 ? "+" : ""}${v.toFixed(3)}`);
+const rvCls = v => (v == null ? "" : v > 0 ? "pos" : v < 0 ? "neg" : "");
+function reviewHtml(r) {
+  if (!r) return `<p class="muted">Belum ada review. Tekan <b>Hitung</b> (±1-5 menit, nggak pakai RPC).</p>`;
+  const t = r.total;
+  const rules = r.rules.map(x => `<tr><td>${esc(x.text)}</td>
+      <td>${x.kept.n} · <span class="${rvCls(x.kept.pnlPct)}">${rvPc(x.kept.pnlPct)}</span></td>
+      <td>${x.out.n} · <span class="${rvCls(x.out.pnlPct)}">${rvPc(x.out.pnlPct)}</span></td>
+      <td>${x.holdsLoto}/${x.coins}</td><td>${x.verdict === "kebukti" ? "✅ kebukti" : x.verdict === "data kurang" ? "… data kurang" : "❔ belum"}</td></tr>`).join("");
+  const coins = r.coins.map(c => `<tr><td><b>${esc(c.symbol)}</b> <span class="tag ${c.class}">${CLASS_TXT[c.class]}</span></td>
+      <td>${c.n}</td><td>${c.capitalSol.toFixed(1)}</td><td class="${rvCls(c.pnlSol)}">${rvSl(c.pnlSol)} (${rvPc(c.pnlPct)})</td>
+      <td class="pos">${rvPc(c.feePct)}</td><td class="${rvCls(c.pricePct)}">${rvPc(c.pricePct)}</td><td>${c.avgChg1h > 0 ? "+" : ""}${c.avgChg1h}%</td></tr>`).join("");
+  const hold = Object.entries(r.hold).map(([k, h]) => `<tr><td>${k}</td><td>${h.n}</td><td class="${rvCls(h.pnlPct)}">${rvPc(h.pnlPct)}</td><td>${h.bigLosses}</td></tr>`).join("");
+  return `<p>${esc((r.from || "").slice(0, 10))} → ${esc((r.to || "").slice(0, 10))} · ${t.n} ladder · modal ◎${t.capitalSol.toFixed(1)}<br>
+      PnL <b class="${rvCls(t.pnlSol)}">◎${rvSl(t.pnlSol)}</b> (${rvPc(t.pnlPct)}) = fee <b class="pos">◎${rvSl(t.feesSol)}</b> + harga <b class="${rvCls(t.priceSol)}">◎${rvSl(t.priceSol)}</b> · ${t.wins}/${t.n} untung
+      <span class="muted">· dihitung ${r.t ? new Date(r.t * 1000).toLocaleString() : "?"}</span></p>
+    <h4>FILTER: KALAU DIPAKAI</h4>
+    <div class="scroll"><table><tr><th>Aturan (setting sekarang)</th><th>Lolos: n · PnL</th><th>Ditolak: n · PnL</th><th>Tahan tanpa 1 koin</th><th></th></tr>${rules}</table></div>
+    <h4>PER KOIN</h4>
+    <div class="scroll"><table><tr><th>Koin</th><th>n</th><th>◎ modal</th><th>PnL</th><th>Fee</th><th>Harga</th><th>Rata2 1h saat masuk</th></tr>${coins}</table></div>
+    <h4>LAMA DIPEGANG</h4>
+    <table><tr><th>Hold</th><th>n</th><th>PnL</th><th>Rugi besar (&lt; −2%)</th></tr>${hold}</table>
+    <p class="note">"Harga" = PnL − fee (rugi/untung karena harga gerak). "Tahan tanpa 1 koin" = berapa kali aturan itu tetap menang kalau satu koin dikeluarin.
+      Sampel kecil: ini bahan buat mutusin setting, bukan jaminan. Ubah aturannya di ⚙ Settings; review ini nyesuain sendiri.</p>`;
+}
+async function openReview() {
+  const wallet = state.wallet || (trade.info && trade.info.wallet) || $("#wallet").value.trim();
+  $("#modalCard").classList.add("wide");
+  $("#modal").classList.remove("hidden");
+  const paint = st => {
+    $("#modalCard").innerHTML = `<h3>📊 Review <span class="muted">ladder lu sendiri · Meteora API, 0 RPC</span></h3>
+      <div class="rv">${st.running ? `<p>⏳ lagi ngitung… ${esc(st.progress || "")}</p>` : ""}${st.error ? `<p class="neg">✗ ${esc(st.error)}</p>` : ""}${reviewHtml(st.last)}</div>
+      <div class="acts"><label>Hari <select id="rvDays">${[7, 14, 30, 60].map(d => `<option ${d === ((st.last && st.last.days) || 30) ? "selected" : ""}>${d}</option>`).join("")}</select></label>
+        <button class="btn go" id="rvRun" ${st.running ? "disabled" : ""}>Hitung${st.last ? " ulang" : ""}</button>
+        <span class="spacer"></span><button class="btn" id="rvClose">Tutup</button></div>`;
+    $("#rvClose").onclick = closeModal;
+    $("#rvRun").onclick = async () => {
+      if (!wallet) { alert("Isi wallet dulu lalu Load."); return; }
+      try {
+        await getJson("/api/review", { method: "POST", headers: { "Content-Type": "application/json", "X-DLMM-Trade": "1" },
+          body: JSON.stringify({ wallet, days: +$("#rvDays").value }) });
+        poll();
+      } catch (e) { alert("Gagal: " + (e.message || e)); }
+    };
+  };
+  const poll = async () => {
+    try {
+      const st = await getJson("/api/review");
+      if ($("#modal").classList.contains("hidden")) return;
+      paint(st);
+      if (st.running) setTimeout(poll, 3000);
+    } catch (e) { $("#modalCard").innerHTML = `<p class="neg">✗ ${esc(e.message || e)}</p>`; }
+  };
+  poll();
+}
 const closeModal = () => { $("#modal").classList.add("hidden"); $("#modalCard").classList.remove("wide"); };
 $("#modal").addEventListener("click", e => { if (e.target.id === "modal") closeModal(); });
 document.addEventListener("keydown", e => {
@@ -1101,6 +1178,7 @@ function paintBottom() {
 $("#cleanupBtn").onclick = () => cleanupWallet($("#cleanupBtn"));
 $("#positions tbody").addEventListener("change", e => { const s = e.target.closest("[data-tp]"); if (s) setAutoExit(s); });
 $("#loadWallet").onclick = loadPortfolio;
+$("#reviewBtn").onclick = openReview;
 $("#wallet").addEventListener("keydown", e => { if (e.key === "Enter") loadPortfolio(); });
 
 (async function init() {
