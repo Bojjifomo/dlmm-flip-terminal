@@ -188,3 +188,14 @@ def evaluate(snapshot: dict, candles_1h: list[dict], cfg: dict, now: datetime | 
             "rangeBottomPriceSol": f["priceSol"] * (1 + bottom / 100) if f["priceSol"] else None,
         },
     }
+
+
+# 🎯 PICK: the owner's own entry filter from the Nov 2026 wallet review, as its own list next to PING.
+# Every gate passes (incl. no +5% hour), the 1h move is known, and none of the review's flags shows.
+PICK_FLAGS = ("young pool", "vol/mcap", "bin step")
+
+
+def pick(c: dict) -> bool:
+    if c.get("gatesFailed") or c.get("priceChg1h") is None:
+        return False
+    return not any(f.startswith(PICK_FLAGS) for f in c.get("flags") or [])

@@ -41,6 +41,7 @@
       <div class="seg mode" id="mode">
         <button data-m="all">ALL</button><button data-m="pass">V1 PASS</button>
         <button data-m="ping">📡 PING <span class="n" id="nPing"></span></button>
+        <button data-m="pick" title="Filter dari review wallet lu: semua gate lolos (termasuk harga 1h ≤ +5%), bukan pool muda, vol/mcap 0.3–3×, bin step ≤ 100">🎯 PICK <span class="n" id="nPick"></span></button>
         <button data-m="watch">★ WATCH <span class="n" id="nWatch"></span></button>
       </div>
       <span class="spacer"></span>
@@ -115,6 +116,7 @@
   <button data-view="pools" data-m="all">☄️<span>Pool</span></button>
   <button data-view="pools" data-m="pass">✅<span>V1</span></button>
   <button data-view="pools" data-m="ping">📡<span>PING</span></button>
+  <button data-view="pools" data-m="pick">🎯<span>PICK</span></button>
   <button data-view="pools" data-m="watch">★<span>Watch</span></button>
   <button data-view="portfolio">💼<span>Portfolio</span></button>
 </nav>
@@ -140,6 +142,6 @@
     }, 8000);
   })();
 </script>
-<script src="app.js?v=13"></script>
+<script src="app.js?v=14"></script>
 </body>
 </html>

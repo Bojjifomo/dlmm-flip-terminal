@@ -120,6 +120,7 @@ def _build_rows(snaps: list[dict], cfg: dict):
             "chg5m": ((m or {}).get("chg") or {}).get("5m"), "icon": (m or {}).get("icon"),
             "priceUsd": filters.token_of(snap).get("price") if filters.sol_side(snap) else None,
             "verdict": v,
+            "pick": filters.pick(c),
         })
     return out, market, now
 
@@ -184,6 +185,10 @@ def pool_rows(cfg: dict, min_tvl: float, force: bool = False) -> dict:
             "maxPositionSol": filters.max_position_sol(cfg), "sizeSol": filters.planned_size_sol(cfg)}
     with _lock:
         _cache[key] = {"t": time.time(), "data": data}
+    try:
+        _pick_notify(out, cfg)
+    except Exception as exc:
+        print(f"pick notify: {exc}")
     if time.time() - _last_log >= LOG_EVERY:   # spec section 5: log every candidate, skipped ones too
         _last_log = time.time()
         from .cli import append
@@ -193,6 +198,39 @@ def pool_rows(cfg: dict, min_tvl: float, force: bool = False) -> dict:
             c["source"] = "web"
             append("candidates.jsonl", c)
     return data
+
+
+# ---------- 🎯 PICK: the review filter as its own list (PING stays as it is) ----------
+PICK_STATE = Path(__file__).resolve().parent / "data" / "pick_state.json"
+
+
+def _pick_notify(rows: list[dict], cfg: dict) -> None:
+    """Telegram (if set) once per pool when it newly enters 🎯 PICK; again only after cooldownHours."""
+    pc = cfg.get("pick") or {}
+    if not pc.get("telegram", True):
+        return
+    try:
+        st = json.loads(PICK_STATE.read_text())
+    except (OSError, ValueError):
+        st = {}
+    now, cool = time.time(), float(pc.get("cooldownHours", 6)) * 3600
+    first_run = not st
+    fresh = [r for r in rows if r.get("pick") and now - st.get(r["pool"], 0) >= cool]
+    for r in rows:
+        if r.get("pick") and r["pool"] in {x["pool"] for x in fresh}:
+            st[r["pool"]] = now
+    st = {k: v for k, v in st.items() if now - v < 7 * 86400}
+    PICK_STATE.parent.mkdir(exist_ok=True)
+    PICK_STATE.write_text(json.dumps(st))
+    if not fresh or first_run:        # the first scan only learns what is already in the list
+        return
+    fresh.sort(key=lambda r: -(r.get("volMcap24h") or 0))
+    lines = [f"🎯 PICK baru ({len(fresh)}): lolos filter review lu"]
+    for r in fresh[:8]:
+        lines.append(f"• {r['symbol']} bin {r['binStep']} · 1h {r['priceChg1h']:+.0f}% · vol/mcap {r.get('volMcap24h') or 0:.2f}x"
+                     f" · fee {r['feePctDay']['24h']:.0f}%/d · TVL ${r['tvlUsd']:,.0f}")
+    from .cli import notify
+    notify("\n".join(lines))
 
 
 # ---------- PING: the signal filter (v1 gates + GMGN bands - dead→alive), top N ----------

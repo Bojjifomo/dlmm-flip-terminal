@@ -45,6 +45,7 @@
     "newEntryAlerts": true,
     "newAlertCooldownHours": 6
   },
+  "pick": {"_note": "🎯 PICK = the owner's review filter as its own list next to PING (PING unchanged): every gate passes (incl. no +5% hour), the 1h move is known, no young-pool / vol-mcap / bin-step flag. Sorted by 24h vol/mcap. Telegram once per pool per cooldownHours.", "telegram": true, "cooldownHours": 6},
   "flip": {
     "_note": "Bid-ask flip (from flip-bot/): a SOL-only slice the price fell through is reopened as a token-only BidAsk range above the price (same bins), and back to SOL below the price when the price runs up through it. Armed per pool in Portfolio (off / alert / auto). While armed, closeBelowRangeAfterMin and priceStopBelowEntryPct do not close that pool's positions.",
     "confirmMinutes": 4,

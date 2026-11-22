@@ -112,6 +112,10 @@ const DEFAULTS = {
     "newEntryAlerts": true,
     "newAlertCooldownHours": 6
   },
+  "pick": {
+    "telegram": true,
+    "cooldownHours": 6
+  },
   "flip": {
     "confirmMinutes": 4,
     "confirmChecks": 2,
