@@ -112,6 +112,13 @@ const DEFAULTS = {
     "newEntryAlerts": true,
     "newAlertCooldownHours": 6
   },
+  "autoReentry": {
+    "abovePct": 5,
+    "confirmChecks": 2,
+    "respectEntryCheck": true,
+    "cooldownMin": 30,
+    "maxPer24h": 6
+  },
   "pick": {
     "telegram": true,
     "cooldownHours": 6

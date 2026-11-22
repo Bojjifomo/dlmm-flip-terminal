@@ -117,6 +117,31 @@ Kenapa TP fix rugi: posisi SOL-only di bawah harga cuma dapet dari fee, PnL bias
 
 `mode: "alert"` = cuma ngabarin ("exit rule hit, tutup sendiri"). `mode: "auto"` = executor nutup posisi. Sisa memecoin dari range **nggak** di-swap otomatis; jual sendiri (di data, jual sisa token makan −3.93 SOL).
 
+## ♻️ Auto re-entry per ladder
+
+Di Portfolio, tiap ladder punya pilihan **re-entry: off / ≥ +5% di atas range**. Kalau harga naik keluar ladder SOL-only (semua slice jadi SOL lagi) dan bertahan minimal **+5% di atas batas atas range** selama 2 cek berturut-turut, server:
+
+1. close semua slice-nya (SOL + fee balik ke wallet),
+2. buka ladder yang sama lagi di harga sekarang: jumlah slice sama, kedalaman sama, bentuk dari ⚙ Settings.
+
+- **Nunggu entry check lolos** (`respectEntryCheck`, default nyala). Kalau harga 1 jam masih > +5%, dia nunggu harganya tenang dulu, soalnya masuk habis pump itu entry terburuk di review lu.
+- Tetap nyala sesudah re-entry, jadi bisa ngikutin harga naik lagi. Jedanya minimal 30 menit, maksimal 6x per 24 jam per pool.
+- Ladder yang pegang token (hasil flip, atau masih in range) nggak disentuh.
+- Cuma jalan selama DLMM Web nyala di Mac. Semua kejadian masuk ke `data/closes.jsonl` (`source: auto-reentry`).
+- Angka-angkanya di `config.json` → `autoReentry` (`abovePct`, `confirmChecks`, `respectEntryCheck`, `cooldownMin`, `maxPer24h`).
+
+## 🔎 Riset narasi (Claude Code, pakai langganan Claude lu)
+
+Di detail pool ada tombol **🔎 Riset narasi**. Isinya: narasi token, momentumnya, siapa yang ngomongin di X, red flag (copycat, dev jual, akun baru), dan kesimpulan **KUAT / SEDANG / LEMAH / BAHAYA**, semua dengan link sumber.
+
+- Yang jalan: **Claude Code** di Mac mini (`claude -p`, cuma boleh web search + web fetch). Pakainya **jatah langganan Claude lu** (Pro/Max), bukan API key, jadi nggak ada tagihan API.
+- Setup sekali di Mac mini: `curl -fsSL https://claude.ai/install.sh | bash`, lalu jalanin `claude` sekali dan login pakai akun Claude lu (langganan).
+- `ANTHROPIC_API_KEY` sengaja dibuang dari environment waktu manggil Claude Code, biar dia nggak pakai kredit API.
+- Jatahnya kebagi sama pemakaian Claude lu yang lain. Kalau limit lagi abis, tombolnya bilang dan lu bisa coba lagi setelah reset.
+- Satu riset kira-kira 1–3 menit. Hasilnya di-cache 6 jam per token (**↻ riset ulang** buat maksa riset baru). Semua riset dicatat di `data/narratives.jsonl`.
+- X sering nolak dibaca langsung, jadi info akun X diambil dari hasil pencarian dan situs lain (CMC, CoinGecko, pump.fun, dll). Kalau follower/umur akun nggak bisa dicek, jawabannya bilang begitu.
+- Ini konteks, bukan sinyal: AI bisa salah. Jawaban tanpa link sumber ditandain ⚠.
+
 ## Bid-ask flip (baru, dari `flip-bot/`)
 
 Per pool di Portfolio ada pilihan **flip: off / alert / auto**. Mekanismenya diambil dari bot flip (`flip-bot/`):

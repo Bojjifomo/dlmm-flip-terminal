@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import api, exits, filters, flip, node, review, settings
+from . import api, exits, filters, flip, narrative, node, reentry, review, settings
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "web"
@@ -701,6 +701,116 @@ def flip_once(cfg: dict, wallet: str) -> list[dict]:
     return done
 
 
+# ---------- auto re-entry (per pool: off / on) ----------
+# data/auto_reentry.json: {"pools": {pool: {"symbol", "armedAt", "status": armed|firing, "checks", "lastAt", "msg",
+#                                          "strategy"}}, "history": [{"pool", "symbol", "at", "ok", "msg"}]}
+def _reentry_file():
+    from .cli import DATA
+    return DATA / "auto_reentry.json"
+
+
+def reentry_load() -> dict:
+    try:
+        d = json.loads(_reentry_file().read_text())
+    except (OSError, ValueError):
+        d = {}
+    d.setdefault("pools", {})
+    d.setdefault("history", [])
+    return d
+
+
+def reentry_save(d: dict) -> None:
+    f = _reentry_file()
+    f.parent.mkdir(exist_ok=True)
+    f.write_text(json.dumps(d, indent=1))
+
+
+def reentry_set(pool: str, symbol: str, on: bool, strategy: str | None = None) -> dict:
+    with _auto_lock:
+        d = reentry_load()
+        if not on:
+            d["pools"].pop(pool, None)
+        else:
+            d["pools"][pool] = {"symbol": symbol, "armedAt": time.time(), "status": "armed", "checks": 0,
+                                "strategy": (strategy or "spot").lower(), "msg": "nyala"}
+        reentry_save(d)
+        return d
+
+
+def reentry_cfg(cfg: dict) -> dict:
+    return {**reentry.DEFAULTS, **(cfg.get("autoReentry") or {})}
+
+
+def pool_check(cfg: dict, address: str) -> dict:
+    """One pool against the entry rules right now (Meteora snapshot + DexScreener moves, no RPC)."""
+    rows, _, _ = _build_rows([api.pool(address)], cfg)
+    return rows[0]
+
+
+def reentry_once(cfg: dict, wallet: str) -> list[dict]:
+    """One pass over the pools armed for auto re-entry: re-open the ladders the price ran out of (upwards)."""
+    from .cli import append, notify, ticks_for_wallet
+    with _auto_lock:
+        armed = {k: v for k, v in reentry_load()["pools"].items() if v.get("status") == "armed"}
+    if not armed:
+        return []
+    rc, now = reentry_cfg(cfg), time.time()
+    by_pool: dict = {}
+    for t in ticks_for_wallet(wallet, now):
+        if t.pool in armed:
+            by_pool.setdefault(t.pool, []).append(t)
+    done = []
+    for pool, a in armed.items():
+        ts = by_pool.get(pool) or []
+        slices = [{"rangeMin": t.range_min, "rangeMax": t.range_max, "solOnly": t.sol_only, "position": t.position} for t in ts]
+        price = ts[0].price if ts else 0
+        with _auto_lock:
+            d = reentry_load()
+            hist = [h for h in d["history"] if h.get("pool") == pool and h.get("ok") and now - h.get("at", 0) < 86400]
+        dec = reentry.evaluate(now, slices, price, a, rc, len(hist), None)
+        entry_failed = None
+        if dec.kind == "fire" and rc["respectEntryCheck"]:
+            try:
+                entry_failed = pool_check(cfg, pool).get("gatesFailed") or []
+            except Exception as exc:
+                entry_failed = [f"entry check nggak kebaca ({str(exc)[:60]})"]
+            dec = reentry.evaluate(now, slices, price, a, rc, len(hist), entry_failed)
+        with _auto_lock:
+            d = reentry_load()
+            if pool not in d["pools"]:
+                continue
+            p = d["pools"][pool]
+            p.update(checks=dec.checks, msg=dec.msg, checkedAt=now)
+            if dec.kind == "fire":
+                p["status"] = "firing"
+            reentry_save(d)
+        if dec.kind != "fire":
+            continue
+        pl = reentry.plan(slices)
+        sym = ts[0].symbol if ts else a.get("symbol")
+        notify(f"♻️ AUTO RE-ENTRY {sym}: {dec.msg} · {pl['slices']} slice sampai −{pl['bottom']:g}%")
+        args = ["--pool", pool, "--positions", ",".join(s["position"] for s in slices), "--maxloss", str(cfg["trade"]["maxLossPct"]),
+                "--reopen", "--slices", str(pl["slices"]), "--bottom", str(pl["bottom"]), "--top", "0",
+                "--strategy", a.get("strategy") or "spot"]
+        res = node.run("reenter.mjs", args, timeout=1500)
+        ok = bool(res.get("ok"))
+        msg = (f"re-entry ◎{res.get('reopenSol')} · {pl['slices']} slice" if ok
+               else f"{res.get('step') or ''} {res.get('error') or 'gagal'}")[:220]
+        with _auto_lock:
+            d = reentry_load()
+            if pool in d["pools"]:
+                # stays armed after a success (it can follow the price up again); a failure turns it off
+                d["pools"][pool].update(status="armed" if ok else "failed", lastAt=now, checks=0, msg=msg)
+            d["history"] = d["history"][-199:] + [{"pool": pool, "symbol": sym, "at": now, "ok": ok, "msg": msg}]
+            reentry_save(d)
+        append("closes.jsonl", {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "source": "auto-reentry",
+                                "pool": pool, "symbol": sym, "positions": [s["position"] for s in slices], "rule": "reentry above range",
+                                **{k: res.get(k) for k in ("ok", "error", "step", "solBack", "reopenSol", "landedSlices")}})
+        notify(f"{'✅' if ok else '❌'} AUTO RE-ENTRY {sym}: {msg}")
+        done.append({"pool": pool, "ok": ok, "msg": msg})
+    return done
+
+
 def _auto_loop(cfg: dict) -> None:
     import sys
     while True:
@@ -710,6 +820,8 @@ def _auto_loop(cfg: dict) -> None:
                 auto_exit_once(cfg, tw["pubkey"])
             if tw.get("ok") and flip_load()["pools"]:
                 flip_once(cfg, tw["pubkey"])
+            if tw.get("ok") and reentry_load()["pools"]:
+                reentry_once(cfg, tw["pubkey"])
         except Exception as exc:
             print(f"[auto-exit] {exc}", file=sys.stderr, flush=True)
         time.sleep(max(1, float((cfg.get("web") or {}).get("autoExitCheckMin", 2))) * 60)
@@ -754,6 +866,7 @@ def portfolio(wallet: str, cfg: dict) -> dict:
     return {"wallet": wallet, "t": now, "rows": rows, "valueSol": f("balancesSol"), "unclaimedSol": f("unclaimedFeesSol"),
             "pnlSol": f("pnlSol"), "depositSol": f("totalDepositSol"), "exitsCfg": cfg["exits"],
             "walletSol": wallet_sol(wallet), "autoExit": auto_load(), "tpChoices": TP_CHOICES,
+            "autoReentry": {"pools": reentry_load()["pools"], "cfg": reentry_cfg(cfg)},
             "flip": {"pools": fl["pools"], "positions": fl["positions"], "history": (fl.get("history") or [])[-20:], "cfg": flip_cfg(cfg)},
             "autoExitCheckMin": (cfg.get("web") or {}).get("autoExitCheckMin", 2)}
 
@@ -797,10 +910,12 @@ class Handler(BaseHTTPRequestHandler):
                 if last and last.get("entries") is not None:
                     last = {**{k: last[k] for k in ("t", "wallet", "days") if k in last}, **review.summarize(last["entries"], self.cfg)}
                 return self._json({**st, "last": last})
+            if u.path == "/api/narrative":
+                hit = narrative.cached(q.get("mint") or "")
+                return self._json({"ok": True, "result": hit, "claudeCode": bool(narrative.find_claude())})
             if u.path == "/api/pool_check":
                 # One pool against the entry rules right now (re-entry asks before re-opening).
-                rows, _, _ = _build_rows([api.pool(q["address"])], self.cfg)
-                r = rows[0]
+                r = pool_check(self.cfg, q["address"])
                 return self._json({k: r.get(k) for k in ("pool", "symbol", "priceChg1h", "priceChg6h", "volMcap24h", "poolAgeHours",
                                                          "gatesFailed", "flags", "verdict")})
             if u.path == "/api/portfolio":
@@ -960,6 +1075,28 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "flip auto butuh key di .env (DLMM_PRIVATE_KEY)"}, 400)
                 d = flip_set(str(body["pool"]), str(body.get("symbol") or ""), mode)
                 return self._json({"ok": True, "flip": {"pools": d["pools"], "positions": d["positions"]}})
+            if self.path == "/api/narrative":
+                # uses the owner's Claude subscription (Claude Code on this Mac): same gate as trading (PIN from the phone)
+                why = self._trade_refused(body)
+                if why:
+                    return self._json({"ok": False, "error": why}, 403)
+                mint = str(body.get("mint") or "").strip()
+                if not mint:
+                    return self._json({"ok": False, "error": "mint kosong"}, 400)
+                extra = {k: body.get(k) for k in ("mcapUsd", "priceChg1h", "priceChg24h", "vol24hUsd") if body.get(k) is not None}
+                res = narrative.research(mint, str(body.get("symbol") or ""), self.cfg, pool=body.get("pool"), extra=extra,
+                                         force=bool(body.get("force")))
+                return self._json(res)
+            if self.path == "/api/autoreentry":
+                why = self._trade_refused(body)
+                if why:
+                    return self._json({"ok": False, "error": why}, 403)
+                on = bool(body.get("on"))
+                if on and not node.trade_wallet().get("ok"):
+                    return self._json({"ok": False, "error": "auto re-entry butuh key di .env (DLMM_PRIVATE_KEY)"}, 400)
+                strategy = str(body.get("strategy") or (self.cfg.get("position") or {}).get("strategy") or "spot")
+                d = reentry_set(str(body["pool"]), str(body.get("symbol") or ""), on, strategy)
+                return self._json({"ok": True, "autoReentry": {"pools": d["pools"], "cfg": reentry_cfg(self.cfg)}})
             if self.path == "/api/autoexit":
                 why = self._trade_refused(body)
                 if why:
