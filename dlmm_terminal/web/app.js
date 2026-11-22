@@ -417,7 +417,7 @@ function renderDetail(r, keepChart) {
     <div class="vbox ${v.level}"><span class="lv">${v.level}</span>${label} <span class="muted">skor ${v.score > 0 ? "+" : ""}${v.score}</span></div>
     <ul class="rs">${li}</ul>
     ${pingLine(r)}
-    <div class="narr" id="narr"><button class="btn" data-narr="${r.pool}">🔎 Riset narasi</button> <span class="muted">Grok (X + web), cadangan Claude · bayar per riset</span></div>
+    <div class="narr" id="narr"><button class="btn" data-narr="${r.pool}">🔎 Riset narasi</button> <span class="muted">Claude Code (langganan Claude lu) · X + web</span></div>
     <div class="allpools" id="allPools"><div class="muted">Semua pool ${esc(r.symbol)}…</div></div>
     <div class="zapbig">
       <button data-zap="${size / 2}">⚡ ${mS(size / 2, 2)} · ${ladderLabel()}</button>
@@ -432,14 +432,14 @@ function renderDetail(r, keepChart) {
   loadNarrative(r, false);
 }
 
-// 🔎 Narasi: Grok (x_search + web_search), Claude when Grok is out of credit. Cached per token on the server.
+// 🔎 Narasi: Claude Code on the Mac (the owner's Claude subscription), web search only. Cached per token on the server.
 const TAG_CLS = { KUAT: "pos", SEDANG: "warn", LEMAH: "muted", BAHAYA: "neg" };
 function narrHtml(n) {
   const md = esc(n.text).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/\[\[(\d+)\]\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">[$1]</a>')
     .replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">link</a>').replace(/\n/g, "<br>");
   const src = (n.sources || []).slice(0, 12).map((x, i) => `<a href="${esc(x.url)}" target="_blank" rel="noopener" title="${esc(x.url)}">${i + 1}. ${esc((x.title || x.url).slice(0, 60))}</a>`).join("");
   const ago = n.t ? Math.round((Date.now() / 1000 - n.t) / 60) : null;
-  return `<div class="narrhead">${n.tag ? `<b class="${TAG_CLS[n.tag] || ""}">${n.tag}</b> · ` : ""}<span class="muted">${esc(n.provider)} ${esc(n.model || "")}${ago != null ? ` · ${ago < 60 ? ago + " menit" : Math.round(ago / 60) + " jam"} lalu` : ""}${(n.fallbackFrom || []).length ? ` · cadangan (Grok: ${esc(n.fallbackFrom[0].slice(0, 80))})` : ""}</span>
+  return `<div class="narrhead">${n.tag ? `<b class="${TAG_CLS[n.tag] || ""}">${n.tag}</b> · ` : ""}<span class="muted">${esc(n.provider)} ${esc(n.model || "")}${ago != null ? ` · ${ago < 60 ? ago + " menit" : Math.round(ago / 60) + " jam"} lalu` : ""}</span>
       <span class="spacer"></span><button class="linkbtn" data-narr="${esc(n.pool || state.sel)}" data-force="1">↻ riset ulang</button></div>
     <div class="narrtext">${md}</div>${src ? `<div class="narrsrc">${src}</div>` : `<div class="neg">⚠ nggak ada link sumber: anggap belum kebukti</div>`}
     <div class="note">Konteks, bukan sinyal: AI bisa salah. Cek sumbernya sebelum percaya.</div>`;
@@ -451,13 +451,13 @@ async function loadNarrative(r, run, force) {
     try {
       const c = await getJson(`/api/narrative?mint=${encodeURIComponent(r.tokenMint)}`, null, 10000);
       if (state.sel !== r.pool) return;
-      if (!c.keys.grok && !c.keys.claude) el.querySelector(".muted").textContent = "isi XAI_API_KEY (Grok) dan/atau ANTHROPIC_API_KEY (Claude) di .env";
+      if (!c.claudeCode) el.querySelector(".muted").textContent = "Claude Code belum ada di Mac ini: install + login (lihat README)";
       if (c.result && c.result.ok) el.innerHTML = narrHtml(c.result);
     } catch (e) {}
     return;
   }
   if (!(trade.info && (trade.info.local || trade.info.pin))) { alert("Riset narasi cuma dari Mac ini (atau set DLMM_WEB_PIN buat dari HP)."); return; }
-  el.innerHTML = `<span class="muted">🔎 riset narasi ${esc(r.symbol)}… (30-90 detik)</span>`;
+  el.innerHTML = `<span class="muted">🔎 Claude Code lagi riset ${esc(r.symbol)}… (1-3 menit)</span>`;
   try {
     const n = await trade.call("/api/narrative", { mint: r.tokenMint, symbol: r.symbol, pool: r.pool, force: !!force,
       mcapUsd: r.mcapUsd, priceChg1h: r.priceChg1h, priceChg24h: r.priceChg24h, vol24hUsd: r.vol24 });

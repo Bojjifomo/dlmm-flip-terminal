@@ -130,14 +130,16 @@ Di Portfolio, tiap ladder punya pilihan **re-entry: off / ≥ +5% di atas range*
 - Cuma jalan selama DLMM Web nyala di Mac. Semua kejadian masuk ke `data/closes.jsonl` (`source: auto-reentry`).
 - Angka-angkanya di `config.json` → `autoReentry` (`abovePct`, `confirmChecks`, `respectEntryCheck`, `cooldownMin`, `maxPer24h`).
 
-## 🔎 Riset narasi (Grok, cadangan Claude)
+## 🔎 Riset narasi (Claude Code, pakai langganan Claude lu)
 
 Di detail pool ada tombol **🔎 Riset narasi**. Isinya: narasi token, momentumnya, siapa yang ngomongin di X, red flag (copycat, dev jual, akun baru), dan kesimpulan **KUAT / SEDANG / LEMAH / BAHAYA**, semua dengan link sumber.
 
-- **Grok** (xAI, tool `x_search` + `web_search`) dipakai duluan. Kalau key-nya belum ada, kreditnya habis, kena limit, atau error, otomatis pindah ke **Claude** (Claude Opus 5.5 + web search).
-- Isi di `.env`: `XAI_API_KEY=` dan/atau `ANTHROPIC_API_KEY=`. Kalau key Anthropic diisi, launcher otomatis nginstall paket `anthropic`.
-- Bayar per riset: Grok ±$5 per 1.000 post X yang diambil ditambah token, Claude ±$10 per 1.000 pencarian ditambah token. Hasilnya di-cache 6 jam per token (**↻ riset ulang** buat maksa riset baru).
-- Semua riset dicatat di `data/narratives.jsonl`, biar nanti bisa dicek narasi mana yang beneran ngasih fee.
+- Yang jalan: **Claude Code** di Mac mini (`claude -p`, cuma boleh web search + web fetch). Pakainya **jatah langganan Claude lu** (Pro/Max), bukan API key, jadi nggak ada tagihan API.
+- Setup sekali di Mac mini: `curl -fsSL https://claude.ai/install.sh | bash`, lalu jalanin `claude` sekali dan login pakai akun Claude lu (langganan).
+- `ANTHROPIC_API_KEY` sengaja dibuang dari environment waktu manggil Claude Code, biar dia nggak pakai kredit API.
+- Jatahnya kebagi sama pemakaian Claude lu yang lain. Kalau limit lagi abis, tombolnya bilang dan lu bisa coba lagi setelah reset.
+- Satu riset kira-kira 1–3 menit. Hasilnya di-cache 6 jam per token (**↻ riset ulang** buat maksa riset baru). Semua riset dicatat di `data/narratives.jsonl`.
+- X sering nolak dibaca langsung, jadi info akun X diambil dari hasil pencarian dan situs lain (CMC, CoinGecko, pump.fun, dll). Kalau follower/umur akun nggak bisa dicek, jawabannya bilang begitu.
 - Ini konteks, bukan sinyal: AI bisa salah. Jawaban tanpa link sumber ditandain ⚠.
 
 ## Bid-ask flip (baru, dari `flip-bot/`)

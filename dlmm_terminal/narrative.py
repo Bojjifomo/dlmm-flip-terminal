@@ -1,9 +1,9 @@
 """🔎 Narasi: research what a token's story is, who is talking about it, and its red flags, before you open a ladder.
 
-Grok (xAI Responses API with the x_search + web_search tools) first: memecoin narratives live on X. When Grok has no key,
-runs out of credit / rate limit, or fails, the same question goes to Claude (Anthropic SDK, web_search server tool).
-Keys in .env: XAI_API_KEY, ANTHROPIC_API_KEY. Results are cached per token (narrative.cacheHours) in data/narrative/
-and logged to data/narratives.jsonl, so 📊 Review can later tell which kinds of narrative paid.
+Runs Claude Code (`claude -p`, web search + web fetch only) on this Mac, logged in with the owner's Claude subscription,
+so it uses the subscription's usage, not API credit: no API key is read or passed. Results are cached per token
+(narrative.cacheHours) in data/narrative/ and logged to data/narratives.jsonl, so 📊 Review can later tell which kinds
+of narrative paid.
 
 Context, not a signal: the answer can be wrong, so every claim should carry a source; nothing here opens or blocks a trade.
 """
@@ -13,18 +13,17 @@ import json
 import os
 import re
 import time
-import urllib.error
+import shutil
+import subprocess
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import api, blast
 
 DIR = Path(__file__).resolve().parent / "data" / "narrative"
 LOG = Path(__file__).resolve().parent / "data" / "narratives.jsonl"
-XAI_URL = "https://api.x.ai/v1/responses"
-DEFAULTS = {"grokModel": "grok-4.7", "claudeModel": "claude-opus-5-5", "cacheHours": 6, "xDays": 14, "maxTurns": 4,
-            "claudeMaxSearches": 5}
+DEFAULTS = {"cacheHours": 6, "timeoutSec": 300, "model": None}   # model None = Claude Code's default for the subscription
 TAGS = ("KUAT", "SEDANG", "LEMAH", "BAHAYA")
 
 SYSTEM = (
@@ -86,13 +85,13 @@ Riset token ini (cari di X dan web, fokus 2 minggu terakhir) dan jawab persis de
 4. **Red flags**: ticker/nama sama dengan token lain (copycat), dev atau wallet besar jual, bundling / sniper, klaim palsu (partnership, listing), akun resmi baru dibuat, website kosong.
 5. **Kesimpulan**: satu kalimat buat LP: kuat atau nggak narasinya, dan apa yang perlu dicek sebelum buka posisi.
 
+Pakai web search (termasuk cari di x.com / twitter.com, DexScreener, pump.fun, situs token). Jangan jalanin hal lain.
+Sesudah kesimpulan tulis "SUMBER:" lalu daftar URL yang kamu pakai, satu per baris.
 Baris terakhir harus persis: TAG: KUAT atau TAG: SEDANG atau TAG: LEMAH atau TAG: BAHAYA"""
 
 
 class ProviderError(Exception):
-    def __init__(self, msg: str, fallback: bool = True):
-        super().__init__(msg)
-        self.fallback = fallback
+    pass
 
 
 def _tag(text: str) -> str | None:
@@ -100,101 +99,65 @@ def _tag(text: str) -> str | None:
     return m.group(1).upper() if m else None
 
 
-def ask_grok(user: str, nc: dict) -> dict:
-    key = os.environ.get("XAI_API_KEY")
-    if not key:
-        raise ProviderError("XAI_API_KEY belum diisi")
-    since = (datetime.now(timezone.utc) - timedelta(days=int(nc["xDays"]))).strftime("%Y-%m-%d")
-    body = {"model": nc["grokModel"], "max_turns": int(nc["maxTurns"]),
-            "input": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
-            "tools": [{"type": "x_search", "from_date": since}, {"type": "web_search"}]}
-    req = urllib.request.Request(XAI_URL, data=json.dumps(body).encode(), method="POST",
-                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                                          "User-Agent": "dlmm-terminal/1"})
-    try:
-        with api.urlopen(req, timeout=180) as r:
-            d = json.load(r)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:300]
-        why = {401: "key xAI salah", 402: "kredit xAI habis", 403: "akses xAI ditolak / kredit habis", 429: "limit xAI kena"}
-        raise ProviderError(f"Grok HTTP {exc.code} ({why.get(exc.code, 'error')}): {detail}") from None
-    except Exception as exc:
-        raise ProviderError(f"Grok nggak jawab: {exc}") from None
-    text, sources = [], {}
-    for item in d.get("output") or []:
-        if item.get("type") != "message":
-            continue
-        for c in item.get("content") or []:
-            if c.get("type") == "output_text":
-                text.append(c.get("text") or "")
-                for a in c.get("annotations") or []:
-                    if a.get("type") == "url_citation" and a.get("url"):
-                        sources.setdefault(a["url"], a.get("title") or a["url"])
-    for u in d.get("citations") or []:
-        if isinstance(u, str):
-            sources.setdefault(u, u)
-    out = "\n".join(text).strip()
-    if not out:
-        raise ProviderError("Grok balikin jawaban kosong")
-    usage = d.get("usage") or {}
-    tools = usage.get("server_side_tool_usage_details") or {}
-    return {"provider": "grok", "model": d.get("model") or nc["grokModel"], "text": out,
-            "sources": [{"url": u, "title": t} for u, t in sources.items()],
-            "usage": {"in": usage.get("input_tokens"), "out": usage.get("output_tokens"),
-                      "xPosts": tools.get("x_posts_fetched"), "xSearches": tools.get("x_search_calls")}}
+def find_claude() -> str | None:
+    """The Claude Code CLI. A server started from Finder may not have ~/.local/bin on PATH, so look there too."""
+    hit = shutil.which("claude")
+    if hit:
+        return hit
+    for p in ("~/.local/bin/claude", "~/.claude/local/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"):
+        p = os.path.expanduser(p)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
 
 
-def ask_claude(user: str, nc: dict) -> dict:
-    if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
-        raise ProviderError("ANTHROPIC_API_KEY belum diisi", fallback=False)
+def _sources(text: str) -> list[dict]:
+    out, seen = [], set()
+    for url in re.findall(r"https?://[^\s)\]>\"']+", text or ""):
+        url = url.rstrip(".,;")
+        if url not in seen:
+            seen.add(url)
+            out.append({"url": url, "title": url})
+    return out
+
+
+def ask_claude_code(user: str, nc: dict) -> dict:
+    """Claude Code in print mode, logged in with the owner's Claude subscription: the usage counts against the
+    subscription, not API credit. ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN are removed from its environment on
+    purpose, or Claude Code would bill that key instead. Only the web tools are available to it."""
+    exe = find_claude()
+    if not exe:
+        raise ProviderError("Claude Code belum ke-install di Mac ini: jalanin  curl -fsSL https://claude.ai/install.sh | bash  "
+                            "lalu  claude  sekali buat login pakai akun Claude lu")
+    env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+    cmd = [exe, "-p", user, "--output-format", "json", "--append-system-prompt", SYSTEM,
+           "--tools", "WebSearch,WebFetch", "--allowedTools", "WebSearch,WebFetch", "--permission-mode", "dontAsk",
+           "--no-session-persistence", "--strict-mcp-config"]
+    if nc.get("model"):
+        cmd += ["--model", str(nc["model"])]
+    DIR.mkdir(parents=True, exist_ok=True)          # run outside the repo: no project CLAUDE.md or settings
     try:
-        import anthropic
-    except ImportError:
-        raise ProviderError("paket 'anthropic' belum ke-install: python3 -m pip install --user anthropic", fallback=False) from None
-    client = anthropic.Anthropic(timeout=240.0)
-    messages = [{"role": "user", "content": user}]
-    tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": int(nc["claudeMaxSearches"])}]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=float(nc["timeoutSec"]), env=env, cwd=str(DIR))
+    except subprocess.TimeoutExpired:
+        raise ProviderError(f"Claude Code nggak selesai dalam {nc['timeoutSec']:g} detik") from None
     try:
-        for _ in range(3):                                  # a long server-tool turn can pause: send it back to continue
-            resp = client.beta.messages.create(
-                model=nc["claudeModel"], max_tokens=16000, system=SYSTEM, messages=messages, tools=tools,
-                output_config={"effort": "medium"},
-                betas=["server-side-fallback-2026-07-01"], fallbacks="default",
-            )
-            if resp.stop_reason != "pause_turn":
-                break
-            messages = messages + [{"role": "assistant", "content": resp.content}]
-    except anthropic.AuthenticationError:
-        raise ProviderError("key Anthropic salah", fallback=False) from None
-    except anthropic.RateLimitError:
-        raise ProviderError("limit Anthropic kena, coba lagi sebentar", fallback=False) from None
-    except anthropic.APIStatusError as exc:
-        raise ProviderError(f"Claude HTTP {exc.status_code}: {exc.message[:200]}", fallback=False) from None
-    except anthropic.APIConnectionError:
-        raise ProviderError("Claude nggak kejangkau (internet?)", fallback=False) from None
-    if resp.stop_reason == "refusal":
-        raise ProviderError("Claude nolak pertanyaan ini", fallback=False)
-    text, sources = [], {}
-    for b in resp.content:
-        if b.type == "text":
-            text.append(b.text)
-            for c in getattr(b, "citations", None) or []:
-                url = getattr(c, "url", None)
-                if url:
-                    sources.setdefault(url, getattr(c, "title", None) or url)
-        elif b.type == "web_search_tool_result" and isinstance(b.content, list):
-            for r in b.content:
-                url = getattr(r, "url", None)
-                if url:
-                    sources.setdefault(url, getattr(r, "title", None) or url)
-    out = "".join(text).strip()
-    if not out:
-        raise ProviderError("Claude balikin jawaban kosong", fallback=False)
-    u = resp.usage
-    return {"provider": "claude", "model": resp.model, "text": out,
-            "sources": [{"url": k, "title": v} for k, v in sources.items()],
-            "usage": {"in": u.input_tokens, "out": u.output_tokens,
-                      "searches": getattr(getattr(u, "server_tool_use", None), "web_search_requests", None)}}
+        d = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {}
+    except ValueError:
+        d = {}
+    text = (d.get("result") or "").strip()
+    if r.returncode != 0 or d.get("is_error") or not text:
+        why = text or (r.stderr or r.stdout or "").strip()[-300:] or f"exit {r.returncode}"
+        low = why.lower()
+        if "login" in low or "not logged in" in low or "authenticat" in low or "api key" in low:
+            why += "  → buka Terminal, jalanin  claude  dan login pakai akun Claude lu (langganan)"
+        elif "limit" in low:
+            why += "  → jatah langganan lagi abis; coba lagi setelah reset"
+        raise ProviderError(f"Claude Code: {why[:400]}")
+    u = d.get("usage") or {}
+    return {"provider": "claude-code", "model": next(iter(d.get("modelUsage") or {}), None) or "claude-code", "text": text,
+            "sources": _sources(text),
+            "usage": {"in": u.get("input_tokens"), "out": u.get("output_tokens"), "turns": d.get("num_turns"),
+                      "seconds": round((d.get("duration_ms") or 0) / 1000)}}
 
 
 def _cache_path(mint: str) -> Path:
@@ -209,32 +172,23 @@ def cached(mint: str) -> dict | None:
 
 
 def research(mint: str, symbol: str, cfg: dict, pool: str | None = None, extra: dict | None = None,
-             force: bool = False, prefer: str = "grok") -> dict:
+             force: bool = False) -> dict:
     nc = {**DEFAULTS, **(cfg.get("narrative") or {})}
     hit = cached(mint)
     if hit and not force and time.time() - hit.get("t", 0) < float(nc["cacheHours"]) * 3600:
         return {**hit, "cached": True}
     info = token_info(mint)
     user = prompt(mint, symbol, info, extra)
-    tried = []
-    order = [ask_grok, ask_claude] if prefer != "claude" else [ask_claude]
-    res = None
-    for fn in order:
-        try:
-            res = fn(user, nc)
-            break
-        except ProviderError as exc:
-            tried.append(str(exc))
-            if not exc.fallback:
-                break
-    if res is None:
-        return {"ok": False, "error": " | ".join(tried) or "nggak ada provider", "tried": tried}
+    try:
+        res = ask_claude_code(user, nc)
+    except ProviderError as exc:
+        return {"ok": False, "error": str(exc)}
     out = {"ok": True, "t": time.time(), "mint": mint, "symbol": symbol, "pool": pool, "tag": _tag(res["text"]),
-           "fallbackFrom": tried, "info": info, **res}
+           "info": info, **res}
     DIR.mkdir(parents=True, exist_ok=True)
     _cache_path(mint).write_text(json.dumps(out))
     with LOG.open("a") as f:
         f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "mint": mint, "symbol": symbol,
                             "pool": pool, "provider": res["provider"], "model": res["model"], "tag": out["tag"],
-                            "usage": res["usage"], "fallbackFrom": tried}) + "\n")
+                            "usage": res["usage"]}) + "\n")
     return out

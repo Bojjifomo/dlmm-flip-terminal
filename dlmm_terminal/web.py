@@ -912,8 +912,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({**st, "last": last})
             if u.path == "/api/narrative":
                 hit = narrative.cached(q.get("mint") or "")
-                keys = {"grok": bool(os.environ.get("XAI_API_KEY")), "claude": bool(os.environ.get("ANTHROPIC_API_KEY"))}
-                return self._json({"ok": True, "result": hit, "keys": keys})
+                return self._json({"ok": True, "result": hit, "claudeCode": bool(narrative.find_claude())})
             if u.path == "/api/pool_check":
                 # One pool against the entry rules right now (re-entry asks before re-opening).
                 r = pool_check(self.cfg, q["address"])
@@ -1077,18 +1076,16 @@ class Handler(BaseHTTPRequestHandler):
                 d = flip_set(str(body["pool"]), str(body.get("symbol") or ""), mode)
                 return self._json({"ok": True, "flip": {"pools": d["pools"], "positions": d["positions"]}})
             if self.path == "/api/narrative":
-                # costs API money (Grok / Claude): same gate as trading (PIN from the phone)
+                # uses the owner's Claude subscription (Claude Code on this Mac): same gate as trading (PIN from the phone)
                 why = self._trade_refused(body)
                 if why:
                     return self._json({"ok": False, "error": why}, 403)
-                from .cli import load_env
-                load_env(reload=True)                      # a key pasted into .env works without a restart
                 mint = str(body.get("mint") or "").strip()
                 if not mint:
                     return self._json({"ok": False, "error": "mint kosong"}, 400)
                 extra = {k: body.get(k) for k in ("mcapUsd", "priceChg1h", "priceChg24h", "vol24hUsd") if body.get(k) is not None}
                 res = narrative.research(mint, str(body.get("symbol") or ""), self.cfg, pool=body.get("pool"), extra=extra,
-                                         force=bool(body.get("force")), prefer=str(body.get("prefer") or "grok"))
+                                         force=bool(body.get("force")))
                 return self._json(res)
             if self.path == "/api/autoreentry":
                 why = self._trade_refused(body)
