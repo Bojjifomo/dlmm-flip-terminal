@@ -4256,9 +4256,22 @@ if (config.runsInWidget) {
     const bins = r.hi - r.lo + 1;
     const slices = Math.min(20, ps.length);
     const def = r.strategy && STRATEGIES.includes(r.strategy) ? r.strategy : "spot";
+    // Re-entry opens a new ladder, so the entry rules apply (e.g. no entry right after a +5% hour).
+    let entryWarn = "";
+    try {
+      const cfgNow = settingsCfg();
+      if (cfgNow && pools.length === 1) {
+        const [snap, dx] = await Promise.all([MET.getJson(`${DATAPI}/pools/${pools[0]}`, { timeout: 12 }),
+          MET.getJson(`https://api.dexscreener.com/latest/dex/pairs/solana/${pools[0]}`, { timeout: 12 }).catch(() => null)]);
+        const pc = (dx && dx.pairs && dx.pairs[0] && dx.pairs[0].priceChange) || {};
+        const c = RULES.evaluate(snap, cfgNow, Date.now(), { changes: { "1h": pc.h1, "6h": pc.h6, "24h": pc.h24 } });
+        if (c.gatesFailed.length) entryWarn = `\u26D4 Entry check: ${c.gatesFailed.map(RULES.nice).join("; ")}. Close and swap now and re-open when it passes?\n\n`;
+        else if (c.flags.length) entryWarn = `\u26A0\uFE0F ${c.flags.map(RULES.nice).join("; ")}\n\n`;
+      }
+    } catch (e) {}
     const a = new Alert();
     a.title = `${DRY_RUN ? "Practice: re-enter" : "Re-enter"} ${r.symbol}?`;
-    a.message = `Closes ${ps.length} slice${ps.length > 1 ? "s" : ""} and opens ${slices} again from the price down, `
+    a.message = entryWarn + `Closes ${ps.length} slice${ps.length > 1 ? "s" : ""} and opens ${slices} again from the price down, `
       + `${bins} bins wide, with the SOL the close returns (about ${fmtSol(r.holdsToken ? r.valueSol : r.solInside, 3)}).\n\n`
       + (r.holdsToken
         ? `The price is inside the ladder, so part of it is the token: what the close returns of it is sold to SOL first (refusing any route more than ${MAX_LOSS_PERCENT}% under the pool price). `

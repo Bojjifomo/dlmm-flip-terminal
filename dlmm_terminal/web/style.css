@@ -291,3 +291,16 @@ tbody tr.sibrow td:first-child { box-shadow: inset 3px 0 0 #275a88; }
 .sale details[open] summary { text-decoration: underline dotted; }
 .linkbtn { background: none; border: 0; padding: 0 2px; color: var(--muted); text-decoration: underline dotted; cursor: pointer; font: inherit; font-size: 11px; }
 .linkbtn:hover { color: var(--text, inherit); }
+
+/* 📊 Review */
+.rv table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 4px 0 10px; }
+.rv th, .rv td { padding: 3px 6px; border-bottom: 1px solid var(--line, #222); text-align: right; white-space: nowrap; }
+.rv th:first-child, .rv td:first-child { text-align: left; white-space: normal; }
+.rv h4 { margin: 12px 0 2px; color: var(--accent); font-size: 12px; letter-spacing: .08em; }
+.rv .tag { padding: 0 6px; border-radius: 8px; font-size: 11px; }
+.rv .tag.good { background: rgba(61,220,132,.15); color: #3ddc84; }
+.rv .tag.priceAte { background: rgba(255,90,95,.15); color: #ff5a5f; }
+.rv .tag.thin { background: rgba(150,150,150,.15); color: #aaa; }
+.rv .scroll { overflow-x: auto; }
+.rv th, .rv td { display: table-cell !important; }   /* the phone rule above hides columns 4-5 of the main tables */
+@media (max-width: 640px) { .rv table { font-size: 11px; } .rv .tag { display: inline-block; margin-top: 2px; } }

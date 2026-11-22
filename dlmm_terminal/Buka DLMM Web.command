@@ -3,6 +3,24 @@
 # Biarin jendela Terminal ini kebuka selama dipakai. caffeinate = Mac nggak sleep.
 # Dari HP / MacBook lewat Tailscale: http://<nama-mac-mini>:<port>  (port = DLMM_WEB_PORT di .env, default 8891)
 cd "$(dirname "$0")/.." || exit 1
+# Moving over from an older copy (Capstone1/dlmm_terminal or dlmm-terminal): take its .env and data/
+# (settings, watchlist, auto exit, flip, logs) once, so nothing has to be typed or copied by hand.
+# Never overwrites what is already here.
+OLD=""
+for d in "$HOME/Projects/src/dlmm-terminal" "$HOME/Capstone1/dlmm_terminal" "$HOME/Projects/src/Capstone1/dlmm_terminal" \
+         /Volumes/*/work/Capstone1/dlmm_terminal /Volumes/*/Capstone1/dlmm_terminal "$HOME/work/Capstone1/dlmm_terminal"; do
+  if [ -f "$d/.env" ] && [ "$(cd "$d" && pwd -P)" != "$(cd dlmm_terminal && pwd -P)" ]; then OLD="$d"; break; fi
+done
+if [ -n "$OLD" ] && [ ! -f dlmm_terminal/.env ]; then
+  cp "$OLD/.env" dlmm_terminal/.env && chmod 600 dlmm_terminal/.env
+  echo "Pakai .env dari versi lama: $OLD"
+fi
+if [ -n "$OLD" ] && [ -d "$OLD/data" ] && [ ! -f dlmm_terminal/data/.migrated ]; then
+  mkdir -p dlmm_terminal/data
+  cp -Rn "$OLD/data/." dlmm_terminal/data/ 2>/dev/null
+  echo "$OLD" > dlmm_terminal/data/.migrated
+  echo "Settings, watchlist, auto exit, dan log dari versi lama ikut dipindah (yang udah ada di sini nggak ditimpa)."
+fi
 # First run: make dlmm_terminal/.env from the template and open it in TextEdit to fill in.
 if [ ! -f dlmm_terminal/.env ]; then
   cp dlmm_terminal/.env.example dlmm_terminal/.env
@@ -28,15 +46,27 @@ PID=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1)
 if [ -n "$PID" ]; then
   CMD=$(ps -p "$PID" -o command= 2>/dev/null)
   if echo "$CMD" | grep -q "dlmm_terminal web"; then
-    echo "DLMM Web udah jalan di $URL (jendela Terminal lain). Buka browser aja."
-    open "$URL"
-    exit 0
+    RUNDIR=$(lsof -a -p "$PID" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    if [ -n "$RUNDIR" ] && [ "$(cd "$RUNDIR" 2>/dev/null && pwd -P)" != "$(pwd -P)" ]; then
+      # An older copy (another folder) is serving: its code is not this one. Offer to stop it.
+      echo ""
+      echo "DLMM Web versi lama lagi jalan dari: $RUNDIR"
+      read -r -p "Matiin yang lama dan jalanin versi ini? (Enter = ya, ketik n = batal) " ans
+      if [ "$ans" = "n" ]; then open "$URL"; exit 0; fi
+      kill "$PID" 2>/dev/null; sleep 2
+      kill -0 "$PID" 2>/dev/null && { kill -9 "$PID" 2>/dev/null; sleep 1; }
+    else
+      echo "DLMM Web udah jalan di $URL (jendela Terminal lain). Buka browser aja."
+      open "$URL"
+      exit 0
+    fi
+  else
+    echo ""
+    echo "Port $PORT kepake app lain: $CMD"
+    echo "Ganti port: buka dlmm_terminal/.env, isi misalnya DLMM_WEB_PORT=8892, save, lalu double-click file ini lagi."
+    read -r -p "Enter buat tutup." _
+    exit 1
   fi
-  echo ""
-  echo "Port $PORT kepake app lain: $CMD"
-  echo "Ganti port: buka dlmm_terminal/.env, isi misalnya DLMM_WEB_PORT=8892, save, lalu double-click file ini lagi."
-  read -r -p "Enter buat tutup." _
-  exit 1
 fi
 HOST=$(scutil --get LocalHostName 2>/dev/null || hostname -s)
 echo "DLMM Web: $URL  ·  dari HP / MacBook (Tailscale): http://$HOST:$PORT  ·  biarin jendela ini kebuka."

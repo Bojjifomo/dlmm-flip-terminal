@@ -28,6 +28,10 @@ jobs:
           node test_ladder.mjs
           node test_txutil.mjs
           node test_flip.mjs
+      - name: iPhone rules = Mac rules (Scriptable golden set)
+        run: |
+          node dlmm_terminal/scriptable/tests/test_dlmm_rules.mjs
+          node dlmm_terminal/scriptable/test_rules.mjs
   flip-bot:
     runs-on: ubuntu-latest
     defaults:
