@@ -615,16 +615,22 @@ def scan_hits(cfg: dict, prof: dict, state: dict, now: float) -> list[tuple[dict
             continue
         passed.append((snap, c))
     tokens = blast.token_stats([c["tokenMint"] for _, c in passed], now) if passed else {}
+    # Rolling price moves from DexScreener, the same numbers the web's pool table shows: Meteora's 1h
+    # candles only compare against the last full hour, which can read +3% while the last 60 min ran +12%.
+    moves = blast.dex_5m([c["pool"] for _, c in passed]) if passed else {}
     for snap, c0 in passed:
         try:
             tok = tokens.get(c0["tokenMint"])
             c, m = _candidate(snap, cfg, prof, with_candles=False, now=now, token=tok)
             if m["score"] >= sig["minMatchScore"]:
                 c, m = _candidate(snap, cfg, prof, with_candles=True, now=now, token=tok)  # price moves for flags
+                _use_moves(c, (moves.get(c["pool"]) or {}).get("chg"), cfg)
         except Exception as exc:
             print(f"error {snap.get('name')}: {exc}", file=sys.stderr)
             continue
-        hit = m["score"] >= sig["minMatchScore"]
+        # Pass 1 had no price moves; with candles a gate can fail now (no entry after a +5% hour), and
+        # then it is not a ping: PING lists only pools you would actually open.
+        hit = m["score"] >= sig["minMatchScore"] and not c["gatesFailed"]
         if hit:
             hit = _revival_check(c, snap, sig, now, excluded)
         if log_all or hit:
@@ -635,6 +641,20 @@ def scan_hits(cfg: dict, prof: dict, state: dict, now: float) -> list[tuple[dict
         state["lastLog"] = now
     state["revivedExcluded"] = excluded
     return hits
+
+
+def _use_moves(c: dict, chg: dict | None, cfg: dict) -> None:
+    """Overwrite the candle-based price moves with DexScreener's rolling ones (when it has them) and
+    judge the gates and flags again with them."""
+    if not chg:
+        return
+    for k, key in (("1h", "priceChg1h"), ("6h", "priceChg6h"), ("24h", "priceChg24h")):
+        if chg.get(k) is not None:
+            c[key] = round(float(chg[k]), 2)
+    c["gatesPassed"], c["gatesFailed"] = filters.gates(c, cfg)
+    c["flags"] = filters.flags(c, cfg)
+    if c["gatesFailed"]:
+        c["decision"], c["decisionReason"] = "skip", "; ".join(c["gatesFailed"])
 
 
 def _revival_check(c: dict, snap: dict, sig: dict, now: float, excluded: list) -> bool:

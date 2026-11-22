@@ -235,3 +235,18 @@ class GmgnFilterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PingMovesTests(unittest.TestCase):
+    def test_rolling_1h_from_dexscreener_can_close_the_gate(self):
+        from dlmm_terminal import cli
+        cfg = {"universe": {"binStepMin": 20, "binStepMax": 250},
+               "gates": {"minPoolAgeMinutes": 60, "minFeeApr24hPct": 1000, "maxPositionPctOfTvl": None, "maxPriceChg1hPct": 5},
+               "flags": {"pump1hPct": 25, "drop6hPct": -17, "minTvlUsd": 25000, "nightEntryLocalHours": [0, 9]}}
+        c = {"solSide": "y", "binStep": 100, "poolAgeHours": 30, "feeApr24h": 5000, "sizeVsTvlPct": 1, "tvlUsd": 50000,
+             "priceChg1h": 3.0, "priceChg6h": 1.0, "entryHourLocal": 14, "gatesFailed": [], "flags": [], "volMcap24h": 1}
+        cli._use_moves(c, {"1h": 11.7, "6h": 2.0, "24h": None}, cfg)
+        self.assertEqual(c["priceChg1h"], 11.7)
+        self.assertTrue(c["gatesFailed"][0].startswith("pump1h: +12% > +5%"))
+        cli._use_moves(c, None, cfg)                     # nothing from DexScreener: unchanged
+        self.assertEqual(c["priceChg1h"], 11.7)
