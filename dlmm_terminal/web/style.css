@@ -304,3 +304,10 @@ tbody tr.sibrow td:first-child { box-shadow: inset 3px 0 0 #275a88; }
 .rv .scroll { overflow-x: auto; }
 .rv th, .rv td { display: table-cell !important; }   /* the phone rule above hides columns 4-5 of the main tables */
 @media (max-width: 640px) { .rv table { font-size: 11px; } .rv .tag { display: inline-block; margin-top: 2px; } }
+
+/* 🔎 Narasi */
+.narr { margin: 8px 0; padding: 8px; border: 1px solid var(--line); border-radius: 8px; font-size: 12px; }
+.narr .narrhead { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+.narr .narrtext { line-height: 1.5; }
+.narr .narrsrc { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; font-size: 11px; }
+.narr .narrsrc a { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

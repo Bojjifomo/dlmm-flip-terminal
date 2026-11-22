@@ -38,6 +38,11 @@ if [ ! -d dlmm_terminal/executor/node_modules/@meteora-ag/dlmm ]; then
   echo "Install Meteora SDK (sekali aja, ±1 menit)…"
   (cd dlmm_terminal/executor && npm install --no-audit --no-fund) || { read -r -p "npm install gagal (lihat error di atas). Enter buat tutup." _; exit 1; }
 fi
+# 🔎 Riset narasi via Claude needs the Anthropic SDK: installed once when ANTHROPIC_API_KEY is filled in.
+if grep -Eq '^ANTHROPIC_API_KEY=.+' dlmm_terminal/.env && ! python3 -c "import anthropic" >/dev/null 2>&1; then
+  echo "Install paket anthropic (buat riset narasi via Claude, sekali aja)…"
+  python3 -m pip install --user --quiet anthropic || echo "pip install anthropic gagal: riset narasi tetap jalan pakai Grok."
+fi
 PORT=$(grep -E '^DLMM_WEB_PORT=[0-9]+' dlmm_terminal/.env | tail -1 | cut -d= -f2 | tr -d '[:space:]')
 PORT=${PORT:-8891}
 URL="http://localhost:$PORT"

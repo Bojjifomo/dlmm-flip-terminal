@@ -417,6 +417,7 @@ function renderDetail(r, keepChart) {
     <div class="vbox ${v.level}"><span class="lv">${v.level}</span>${label} <span class="muted">skor ${v.score > 0 ? "+" : ""}${v.score}</span></div>
     <ul class="rs">${li}</ul>
     ${pingLine(r)}
+    <div class="narr" id="narr"><button class="btn" data-narr="${r.pool}">🔎 Riset narasi</button> <span class="muted">Grok (X + web), cadangan Claude · bayar per riset</span></div>
     <div class="allpools" id="allPools"><div class="muted">Semua pool ${esc(r.symbol)}…</div></div>
     <div class="zapbig">
       <button data-zap="${size / 2}">⚡ ${mS(size / 2, 2)} · ${ladderLabel()}</button>
@@ -428,7 +429,48 @@ function renderDetail(r, keepChart) {
     <div class="chart"><iframe src="${chart}" title="chart" loading="lazy"></iframe></div>`;
   if (old && old.querySelector("iframe").src === chart) $("#detail .chart").replaceWith(old);
   renderAllPools(r);
+  loadNarrative(r, false);
 }
+
+// 🔎 Narasi: Grok (x_search + web_search), Claude when Grok is out of credit. Cached per token on the server.
+const TAG_CLS = { KUAT: "pos", SEDANG: "warn", LEMAH: "muted", BAHAYA: "neg" };
+function narrHtml(n) {
+  const md = esc(n.text).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/\[\[(\d+)\]\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">[$1]</a>')
+    .replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">link</a>').replace(/\n/g, "<br>");
+  const src = (n.sources || []).slice(0, 12).map((x, i) => `<a href="${esc(x.url)}" target="_blank" rel="noopener" title="${esc(x.url)}">${i + 1}. ${esc((x.title || x.url).slice(0, 60))}</a>`).join("");
+  const ago = n.t ? Math.round((Date.now() / 1000 - n.t) / 60) : null;
+  return `<div class="narrhead">${n.tag ? `<b class="${TAG_CLS[n.tag] || ""}">${n.tag}</b> · ` : ""}<span class="muted">${esc(n.provider)} ${esc(n.model || "")}${ago != null ? ` · ${ago < 60 ? ago + " menit" : Math.round(ago / 60) + " jam"} lalu` : ""}${(n.fallbackFrom || []).length ? ` · cadangan (Grok: ${esc(n.fallbackFrom[0].slice(0, 80))})` : ""}</span>
+      <span class="spacer"></span><button class="linkbtn" data-narr="${esc(n.pool || state.sel)}" data-force="1">↻ riset ulang</button></div>
+    <div class="narrtext">${md}</div>${src ? `<div class="narrsrc">${src}</div>` : `<div class="neg">⚠ nggak ada link sumber: anggap belum kebukti</div>`}
+    <div class="note">Konteks, bukan sinyal: AI bisa salah. Cek sumbernya sebelum percaya.</div>`;
+}
+async function loadNarrative(r, run, force) {
+  const el = $("#narr");
+  if (!el || !r.tokenMint) return;
+  if (!run) {
+    try {
+      const c = await getJson(`/api/narrative?mint=${encodeURIComponent(r.tokenMint)}`, null, 10000);
+      if (state.sel !== r.pool) return;
+      if (!c.keys.grok && !c.keys.claude) el.querySelector(".muted").textContent = "isi XAI_API_KEY (Grok) dan/atau ANTHROPIC_API_KEY (Claude) di .env";
+      if (c.result && c.result.ok) el.innerHTML = narrHtml(c.result);
+    } catch (e) {}
+    return;
+  }
+  if (!(trade.info && (trade.info.local || trade.info.pin))) { alert("Riset narasi cuma dari Mac ini (atau set DLMM_WEB_PIN buat dari HP)."); return; }
+  el.innerHTML = `<span class="muted">🔎 riset narasi ${esc(r.symbol)}… (30-90 detik)</span>`;
+  try {
+    const n = await trade.call("/api/narrative", { mint: r.tokenMint, symbol: r.symbol, pool: r.pool, force: !!force,
+      mcapUsd: r.mcapUsd, priceChg1h: r.priceChg1h, priceChg24h: r.priceChg24h, vol24hUsd: r.vol24 });
+    if (state.sel !== r.pool) return;
+    el.innerHTML = n.ok ? narrHtml(n) : `<div class="neg">✗ ${esc(n.error || "gagal")}</div><button class="btn" data-narr="${r.pool}">coba lagi</button>`;
+  } catch (e) { el.innerHTML = `<div class="neg">✗ ${esc(e.message || e)}</div><button class="btn" data-narr="${r.pool}">coba lagi</button>`; }
+}
+document.addEventListener("click", e => {
+  const b = e.target.closest("[data-narr]");
+  if (!b || !state.data) return;
+  const r = state.data.rows.find(x => x.pool === b.dataset.narr) || rowOf(state.sel);
+  if (r) loadNarrative(r, true, !!b.dataset.force);
+});
 
 // Detail: every DLMM SOL pool of this token (zap any of them) and its pools on other venues (context).
 async function renderAllPools(r) {
@@ -743,6 +785,32 @@ async function setAutoExit(sel) {
   renderPortfolio();
 }
 
+// Auto re-entry per ladder: the price ran out of a SOL-only ladder upwards and holds at least +abovePct% over its
+// top: the server closes it and opens the same ladder again at the price (waits for the entry check by default).
+function reentryCell(p) {
+  const ar = state.pf.autoReentry || { pools: {}, cfg: {} }, a = ar.pools[p.pool], c = ar.cfg || {};
+  const on = a && (a.status === "armed" || a.status === "firing");
+  const opts = `<option value="0" ${on ? "" : "selected"}>re-entry: off</option><option value="1" ${on ? "selected" : ""}>re-entry ≥ +${c.abovePct ?? 5}% di atas range</option>`;
+  let st = "";
+  if (a && a.status === "armed") st = `<span class="tp on">♻️ ${esc(a.msg || "nyala")}</span>`;
+  else if (a && a.status === "firing") st = `<span class="tp warn">⏳ lagi re-entry…</span>`;
+  else if (a && a.status === "failed") st = `<span class="tp neg">✗ re-entry gagal (dimatiin): ${esc(a.msg || "")}</span>`;
+  return `<div class="tpbox"><select class="tpsel" data-reentry="${p.pool}" data-sym="${esc(p.symbol)}" title="Auto re-entry: kalau harga naik keluar ladder (semua jadi SOL) dan bertahan ≥ +${c.abovePct ?? 5}% di atas batas atas range, server close + buka ladder yang sama lagi di harga sekarang. ${c.respectEntryCheck === false ? "" : "Nunggu entry check lolos (harga 1h ≤ +5%)."} Cooldown ${c.cooldownMin ?? 30} menit, maks ${c.maxPer24h ?? 6}x/24 jam.">${opts}</select>${st}</div>`;
+}
+async function setReentry(sel) {
+  const on = sel.value === "1";
+  if (!trade.ready()) { alert(trade.why()); renderPortfolio(); return; }
+  const c = (state.pf.autoReentry || {}).cfg || {};
+  if (on && !confirm(`Nyalain AUTO RE-ENTRY ${sel.dataset.sym}?\n\nKalau harga naik keluar ladder (semua slice jadi SOL) dan bertahan ≥ +${c.abovePct ?? 5}% di atas batas atas range (${c.confirmChecks ?? 2} cek berturut), server close semua slice dan buka ladder yang sama lagi di harga sekarang, pakai key di .env, tanpa nanya.\n${c.respectEntryCheck === false ? "" : "Dia nunggu entry check lolos dulu (harga 1h ≤ +5%): masuk pas habis pump itu entry terburuk di review lu.\n"}Tetap nyala sesudahnya (cooldown ${c.cooldownMin ?? 30} menit, maks ${c.maxPer24h ?? 6}x per 24 jam). Cuma jalan selama DLMM Web nyala.`)) { renderPortfolio(); return; }
+  try {
+    const r = await trade.call("/api/autoreentry", { pool: sel.dataset.reentry, symbol: sel.dataset.sym, on });
+    state.pf.autoReentry = r.autoReentry;
+    toast(on ? `♻️ Auto re-entry ${sel.dataset.sym} nyala` : `Auto re-entry ${sel.dataset.sym} mati`);
+  } catch (e) { alert("Gagal: " + e.message); }
+  renderPortfolio();
+}
+document.addEventListener("change", e => { const s = e.target.closest("[data-reentry]"); if (s) setReentry(s); });
+
 // Bid-ask flip per pool (off / alert / auto): a SOL slice the price fell through is reopened as token above the
 // price (ask), and back to SOL below the price when the price runs up through it. The server checks on the same
 // clock as the auto exit; "alert" waits for the Flip button here, "auto" sends it.
@@ -912,6 +980,7 @@ function renderPortfolio() {
       <div class="lc3">${status}</div>
       <div class="lbtns"><button class="btn ${exit ? "danger" : ""}" data-close="${ids}">${exit ? "Exit" : "Close"}</button><button class="btn" data-swap="${ids}">Close+swap</button><button class="btn go" data-reenter="${ids}">Re-entry</button></div>
       ${autoExitCell(p, pnlPct)}
+      ${reentryCell(p)}
       ${flipCell(p, rows)}
     </div>`);
     return `<tr>
@@ -924,6 +993,7 @@ function renderPortfolio() {
         <button class="btn" data-swap="${ids}" title="Close semua slice + jual token ke SOL">Close+swap</button>
         <button class="btn go" data-reenter="${ids}" title="Close + jual token + buka ladder lagi di harga sekarang (juga kalau masih in range)">Re-entry</button>
         ${autoExitCell(p, pnlPct)}
+        ${reentryCell(p)}
         ${flipCell(p, rows)}
         <a href="https://app.meteora.ag/dlmm/${p.pool}" target="_blank" rel="noopener">meteora ↗</a></td>
     </tr>`;
