@@ -11,7 +11,7 @@ import { sellToSol, jupQuote } from "./swap.mjs";
 import { guardMain, sendLegacy } from "./txutil.mjs";
 
 const require = createRequire(import.meta.url);
-const { PublicKey, Transaction, TransactionInstruction } = require("@solana/web3.js");
+const { PublicKey, Transaction, TransactionInstruction, ComputeBudgetProgram } = require("@solana/web3.js");
 const WSOL = "So11111111111111111111111111111111111111112";
 const KEEP = new Set([WSOL, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]);
 const PROGRAMS = ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"];
@@ -93,6 +93,8 @@ let closed = 0;
 if (!flag("no-close") && !dry) {
   for (let i = 0; i < empties.length; i += 8) {
     const tx = new Transaction();
+    // a priority fee, or on a busy network the close sits unconfirmed until its blockhash expires (23 Nov)
+    tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
     for (const a of empties.slice(i, i + 8)) {
       tx.add(new TransactionInstruction({ programId: new PublicKey(a.program), data: Buffer.from([9]),
         keys: [{ pubkey: a.address, isSigner: false, isWritable: true }, { pubkey: owner, isSigner: false, isWritable: true }, { pubkey: owner, isSigner: true, isWritable: false }] }));

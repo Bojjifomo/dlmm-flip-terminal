@@ -8,6 +8,7 @@
 // Sending prints one JSON line at the end: {"ok", "position", "signatures": [...]}.
 // --dry-run builds the transactions and simulates them without signing or sending.
 // Leftover memecoin from the range is NOT swapped to SOL here; sell it yourself (spec: leftovers cost -3.93 SOL).
+import { progress } from "./progress.mjs";
 import { createRequire } from "node:module";
 import { loadSigner } from "./keys.mjs";
 import { connectionFor, rpcStats } from "./rpc.mjs";
@@ -110,7 +111,7 @@ if (!dryRun) {
           if (round === 2) throw e;
         }
       }
-    });
+    }, { waitMs: 180000, onWait: (pid, s) => progress(`posisi ${positionAddr.slice(0, 6)}… lagi dipegang proses lain (pid ${pid}), nunggu ${s}s…`) });
   } catch (e) {
     if (!(await exists())) { print({ ok: true, position: positionAddr, signatures: sigs, alreadyClosed: sigs.length === 0 }); process.exit(0); }
     print({ ok: false, position: positionAddr, signatures: sigs, busy: !!e.busy, error: String(e.message || e).slice(0, 300) });
