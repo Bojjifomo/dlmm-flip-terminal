@@ -124,7 +124,10 @@ export async function sellToSol(mint, rawAmount, opts) {
   else {
     // One sale per token at a time: the web button, Cleanup, the auto exit retry and Close+swap used to sell the
     // same token at once, each from the balance it read at its start -> "insufficient funds" on the second half.
-    try { res = await withLock(`sell-${mint}`, () => sellToSolInner(mint, rawAmount, opts)); }
+    try {
+      res = await withLock(`sell-${mint}`, () => sellToSolInner(mint, rawAmount, opts),
+        { waitMs: 240000, onWait: (pid, s) => progress(`token ini lagi dijual proses lain (pid ${pid}), nunggu ${s}s…`) });
+    }
     catch (e) { if (!e.busy) throw e; res = { ok: false, busy: true, error: e.message, tried: [] }; }
   }
   if (!opts.dry) logSale({ mint, raw: String(rawAmount), ok: res.ok, via: res.via, sol: res.sol, signature: res.signature, error: res.error, pieces: res.pieces, soldRaw: res.soldRaw, tried: res.tried });

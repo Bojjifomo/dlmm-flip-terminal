@@ -1,6 +1,7 @@
 // node dlmm_terminal/executor/test_txutil.mjs — send / lock / balance helpers, against a fake connection (no RPC).
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { sendLegacy, confirmOrCheck, withLock, tokenHoldings } from "./txutil.mjs";
@@ -74,6 +75,21 @@ function fake({ confirm = [], status = [], height = 0, sim = null } = {}) {
   fs.writeFileSync(stale, JSON.stringify({ pid: 999999999, t: Date.now() }));
   assert.equal(await withLock(`${name}-3`, async () => "ok"), "ok");
   assert.ok(!fs.existsSync(stale));
+}
+
+// 6b. lock with waitMs: waits for the other holder to finish instead of refusing (22-23 Nov "lagi diproses proses lain")
+{
+  const name = `test-wait-${process.pid}`;
+  const file = fileURLToPath(new URL(`../data/locks/${name}.lock`, import.meta.url));
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ pid: process.ppid, t: Date.now() }));
+  setTimeout(() => fs.unlinkSync(file), 2500);                 // the other process finishes after 2.5 s
+  const t0 = Date.now();
+  assert.equal(await withLock(name, async () => "waited", { waitMs: 10000 }), "waited");
+  assert.ok(Date.now() - t0 >= 2000);
+  fs.writeFileSync(file, JSON.stringify({ pid: process.ppid, t: Date.now() }));
+  await assert.rejects(withLock(name, async () => 1, { waitMs: 2500 }), e => e.busy === true && /2 detik|3 detik/.test(e.message));
+  fs.unlinkSync(file);
 }
 
 // 7. holdings: only the associated account counts as spendable

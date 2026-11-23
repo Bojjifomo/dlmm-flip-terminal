@@ -97,10 +97,14 @@ const STALE_MS = 15 * 60 * 1000;
 const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
 
 /** Run `fn` holding the lock `name`; when another live process holds it, throw (err.busy). */
-export async function withLock(name, fn) {
+// waitMs: how long to wait for another live holder to finish before giving up (0 = refuse at once). Waiting is safe
+// because every holder re-reads the chain inside the lock (a close finds the position gone, a sale sees what is left).
+export async function withLock(name, fn, { waitMs = 0, onWait = null } = {}) {
   fs.mkdirSync(LOCK_DIR, { recursive: true });
   const file = path.join(LOCK_DIR, name.replace(/[^A-Za-z0-9_.-]/g, "_") + ".lock");
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const t0 = Date.now();
+  let told = 0;
+  for (let attempt = 0; ; attempt++) {
     try {
       fs.writeFileSync(file, JSON.stringify({ pid: process.pid, t: Date.now() }), { flag: "wx" });
       break;
@@ -109,10 +113,15 @@ export async function withLock(name, fn) {
       let held = {};
       try { held = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
       if (held.pid && held.pid !== process.pid && alive(held.pid) && Date.now() - (held.t || 0) < STALE_MS) {
-        throw Object.assign(new Error(`lagi diproses proses lain (pid ${held.pid}): tunggu sebentar lalu coba lagi`), { busy: true });
+        if (Date.now() - t0 < waitMs) {
+          if (onWait && Date.now() - told > 30000) { told = Date.now(); try { onWait(held.pid, Math.round((Date.now() - t0) / 1000)); } catch {} }
+          await sleep(2000);
+          continue;
+        }
+        throw Object.assign(new Error(`lagi diproses proses lain (pid ${held.pid})${waitMs ? ` dan belum selesai setelah ${Math.round(waitMs / 1000)} detik` : ""}: tunggu sebentar lalu coba lagi`), { busy: true });
       }
       try { fs.unlinkSync(file); } catch {}                  // stale: its process is gone
-      if (attempt === 1) throw Object.assign(new Error("lock file kepake"), { busy: true });
+      if (attempt >= 3) throw Object.assign(new Error("lock file kepake"), { busy: true });
     }
   }
   const release = () => {

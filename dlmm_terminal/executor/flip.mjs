@@ -87,7 +87,7 @@ async function main() {
   if (dry) { out({ ok: true, mode: "dry-run", plan }); process.exit(0); }
 
   try {
-    await withLock(`position-${positionAddr}`, () => flip({ connection, dlmm, signer, owner, positionPk, plan, tokenIsX, solIsX, gap, slippagePct, reserveLamports }));
+    await withLock(`position-${positionAddr}`, () => flip({ connection, dlmm, signer, owner, positionPk, plan, tokenIsX, solIsX, gap, slippagePct, reserveLamports }), { waitMs: 60000 });
   } catch (e) {
     fail(String(e.message || e).slice(0, 400), { busy: !!e.busy, ...(e.extra || {}) });
   }
