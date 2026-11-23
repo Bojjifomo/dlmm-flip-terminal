@@ -106,4 +106,37 @@ function fake({ confirm = [], status = [], height = 0, sim = null } = {}) {
   assert.equal(h.others.length, 1);
   assert.equal(h.program, T22.toBase58());
 }
+// 8. the owner index lags (SIDOOR 23 Nov): it lists nothing, the associated account read directly holds the token
+{
+  const owner = Keypair.generate().publicKey, mint = Keypair.generate().publicKey;
+  const TK = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+  const ata = spl.getAssociatedTokenAddressSync(mint, owner, true, TK);
+  const mintData = Buffer.alloc(82); mintData[44] = 6;
+  const accData = Buffer.alloc(165); accData.writeBigUInt64LE(79916192917n, 64); accData[108] = 1;
+  const conn = {
+    getParsedTokenAccountsByOwner: async () => ({ value: [] }),                     // stale index: nothing
+    getAccountInfo: async pk => pk.equals(mint) ? { owner: TK, data: mintData } : pk.equals(ata) ? { owner: TK, data: accData } : null,
+  };
+  const h = await tokenHoldings(conn, owner, mint.toBase58());
+  assert.equal(h.total, 79916192917n);
+  assert.equal(h.ata, 79916192917n);
+  assert.equal(h.program, TK.toBase58());
+  assert.equal(h.decimals, 6);
+  // index and direct read agree: counted once
+  const conn2 = { ...conn, getParsedTokenAccountsByOwner: async (_o, f) => ({ value: f.programId.equals(TK)
+    ? [{ pubkey: ata, account: { data: { parsed: { info: { state: "initialized", tokenAmount: { amount: "79916192917", decimals: 6 } } } } } }] : [] }) };
+  assert.equal((await tokenHoldings(conn2, owner, mint.toBase58())).total, 79916192917n);
+}
+// 9. an RPC that answers {mint, programId} by mint alone: the same account comes back for both programs
+{
+  const owner = Keypair.generate().publicKey, mint = Keypair.generate().publicKey;
+  const TK = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+  const ata = spl.getAssociatedTokenAddressSync(mint, owner, true, TK);
+  const one = { pubkey: ata, account: { owner: TK, data: { parsed: { info: { mint: mint.toBase58(), state: "initialized", tokenAmount: { amount: "500", decimals: 6 } } } } } };
+  const conn = { getParsedTokenAccountsByOwner: async () => ({ value: [one] }) };   // ignores programId
+  const h = await tokenHoldings(conn, owner, mint.toBase58());
+  assert.equal(h.total, 500n, "counted once");
+  assert.equal(h.ata, 500n, "found as the associated account, not 'nothing held'");
+  assert.equal(h.program, TK.toBase58());
+}
 console.log("txutil tests ok");

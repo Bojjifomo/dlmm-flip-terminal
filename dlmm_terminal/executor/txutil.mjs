@@ -133,29 +133,62 @@ export async function withLock(name, fn, { waitMs = 0, onWait = null } = {}) {
 
 // ---------- token holdings ----------
 /** {total, ata, ataAddress, program, decimals, others: [{address, amount, frozen}]} for `mint` in `owner`'s wallet. */
+/** The wallet's associated token account for `mint`, read DIRECTLY by address (always current), with the token
+ *  program taken from the mint itself. getTokenAccountsByOwner goes through the RPC's owner index, which can lag far
+ *  behind (SIDOOR, 23 Nov: 79,916 tokens landed at 23:35 and the index said 0 until about 00:05, so five sales
+ *  reported "nothing held"). Returns {amount, address, program, decimals, exists, frozen}. */
+export async function directAta(connection, owner, mint) {
+  const spl = require("@solana/spl-token");
+  const mintPk = new PublicKey(mint);
+  const mintAcc = await connection.getAccountInfo(mintPk, "confirmed");
+  if (!mintAcc) return { amount: 0n, address: null, program: null, decimals: 0, exists: false, frozen: false };
+  const program = mintAcc.owner.toBase58();
+  const address = spl.getAssociatedTokenAddressSync(mintPk, owner, true, mintAcc.owner);
+  const decimals = mintAcc.data[44];                                   // spl mint layout: decimals at byte 44
+  const acc = await connection.getAccountInfo(address, "confirmed");
+  if (!acc || acc.data.length < 109) return { amount: 0n, address, program, decimals, exists: !!acc, frozen: false };
+  const amount = acc.data.readBigUInt64LE(64);                         // spl account layout: amount at byte 64
+  const frozen = acc.data[108] === 2;                                  // state: 0 uninit, 1 initialized, 2 frozen
+  return { amount, address, program, decimals, exists: true, frozen };
+}
+
 export async function tokenHoldings(connection, owner, mint) {
   const spl = require("@solana/spl-token");
   const mintPk = new PublicKey(mint);
-  let total = 0n, decimals = 0, program = null;
-  const accounts = [];
+  let decimals = 0;
+  // Each account once, with its program from the account itself: some RPCs answer a {mint, programId} filter by
+  // mint alone, so asking per program returned the same accounts twice (total doubled, and the associated account
+  // was looked for under the wrong program -> "nothing held" while the wallet held the token).
+  const byAddr = new Map();
   for (const programId of TOKEN_PROGRAMS) {
     const r = await connection.getParsedTokenAccountsByOwner(owner, { mint: mintPk, programId: new PublicKey(programId) });
     for (const a of r.value) {
       const info = a.account.data.parsed.info;
-      const amount = BigInt(info.tokenAmount.amount);
+      if (info.mint && info.mint !== mintPk.toBase58()) continue;
       decimals = info.tokenAmount.decimals;
-      program = programId;
-      total += amount;
-      accounts.push({ address: a.pubkey, amount, frozen: info.state === "frozen" });
+      const prog = a.account.owner ? new PublicKey(a.account.owner).toBase58() : programId;
+      byAddr.set(a.pubkey.toBase58(), { address: a.pubkey, amount: BigInt(info.tokenAmount.amount), frozen: info.state === "frozen", program: prog });
     }
   }
+  const accounts = [...byAddr.values()];
+  // the associated account read directly by address: the owner index above can be minutes behind
+  const d = await directAta(connection, owner, mint).catch(() => null);
+  const program = (d && d.program) || (accounts[0] && accounts[0].program) || null;
   if (!program) return { total: 0n, ata: 0n, ataAddress: null, program: null, decimals, others: [] };
+  if (d && d.program) decimals = d.decimals || decimals;
   const ataAddress = spl.getAssociatedTokenAddressSync(mintPk, owner, true, new PublicKey(program));
-  let ata = 0n;
+  let ata = 0n, total = 0n, seenAta = false;
   const others = [];
   for (const a of accounts) {
-    if (a.address.equals(ataAddress)) ata = a.frozen ? 0n : a.amount;
-    else if (a.amount > 0n) others.push(a);
+    if (a.address.equals(ataAddress)) { seenAta = true; ata = a.frozen ? 0n : a.amount; total += a.amount; }
+    else { total += a.amount; if (a.amount > 0n) others.push(a); }
+  }
+  if (d && d.address && d.address.equals(ataAddress) && d.exists) {        // trust the direct read for the ATA
+    const idx = seenAta ? ata : 0n;
+    const fresh = d.frozen ? 0n : d.amount;
+    total += d.amount - (seenAta ? (accounts.find(a => a.address.equals(ataAddress)) || { amount: 0n }).amount : 0n);
+    ata = fresh;
+    void idx;
   }
   return { total, ata, ataAddress, program, decimals, others };
 }
