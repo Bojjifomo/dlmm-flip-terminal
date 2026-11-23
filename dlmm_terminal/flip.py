@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 DEFAULTS = {"confirmMinutes": 4, "confirmChecks": 2, "maxFlipsPer24h": 8, "gapBins": 1, "slippagePct": 1,
-            "minSolReserve": 0.05}
+            "minSolReserve": 0.05, "wholeLadder": True}
 MODES = ("off", "alert", "auto")
 
 
@@ -90,6 +90,30 @@ def evaluate(now: float, price: float, range_min: float, range_max: float, sol_o
     if flips_24h >= int(c["maxFlipsPer24h"]):
         return Decision("limit", to, f"udah {flips_24h} flip di pool ini 24 jam terakhir (max {c['maxFlipsPer24h']})")
     return Decision("flip", to, f"{state.side} ketembus {held:.0f} menit → flip ke {to}")
+
+
+def ladder_gate(decisions: list[tuple[str | None, "Decision"]], price: float, bid_bottom: float | None,
+                cfg: dict) -> list["Decision"]:
+    """bid → ask waits for the whole ladder (wholeLadder): a crossed bid slice is only flipped once every bid slice
+    of the pool is crossed and confirmed (the price is under the bottom of the last slice), and then they all flip
+    together. decisions: [(side, Decision)] of one pool's positions, in any order. Returns the decisions to act on."""
+    c = {**DEFAULTS, **(cfg or {})}
+    if not c.get("wholeLadder"):
+        return [d for _, d in decisions]
+    bids = [d for side, d in decisions if side == "bid"]
+    all_ready = bool(bids) and all(d.kind == "flip" and d.to == "ask" for d in bids)
+    if all_ready:
+        return [d for _, d in decisions]
+    left = ""
+    if bid_bottom and price > 0:
+        left = f" (harga {(bid_bottom / price - 1) * 100:+.1f}% dari bawah ladder)"
+    out = []
+    for side, d in decisions:
+        if side == "bid" and d.kind in ("flip", "confirming", "limit"):
+            out.append(Decision("wait", None, f"bid ketembus, nunggu seluruh ladder ketembus dulu{left}"))
+        else:
+            out.append(d)
+    return out
 
 
 # ---------- shared by the web server and `monitor` ----------

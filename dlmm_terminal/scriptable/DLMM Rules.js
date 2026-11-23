@@ -129,7 +129,8 @@ const DEFAULTS = {
     "maxFlipsPer24h": 8,
     "gapBins": 1,
     "slippagePct": 1,
-    "minSolReserve": 0.05
+    "minSolReserve": 0.05,
+    "wholeLadder": true
   },
   "exits": {
     "mode": "alert",

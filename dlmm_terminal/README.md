@@ -176,6 +176,10 @@ Angka di `config.json` → `flip` (`gapBins`, `slippagePct`, `minSolReserve` bua
 
 Risiko: token yang terus turun bikin lu pegang token di ask yang nggak pernah ke-fill (sama kayak bot flip). Flip nggak ngejual rugi; buat keluar, pakai Close+swap.
 
+**Aturan baru (23 Nov):**
+- **Flip nunggu seluruh ladder ketembus.** Slice yang ketembus nggak di-flip satu-satu. Flip baru jalan kalau harga udah di bawah ujung slice terakhir (dan terkonfirmasi), terus semua slice di-flip barengan. Matiin pakai `flip.wholeLadder: false`.
+- **TP otomatis mati sesudah flip atau re-entry** (auto maupun tombol). Alasannya: flip ngerealisasi rugi slice yang ditutup, jadi PnL posisi baru mulai dari nol. Kalau TP tetap nyala, dia bisa nembak di +5% padahal ladder secara total masih rugi (Singularity, 23 Nov). Di Portfolio muncul "TP dimatiin otomatis", dan bisa lu nyalain lagi kalau mau.
+
 ## Perbaikan dari versi lama (error di Portfolio)
 
 | Error lama | Penyebab | Sekarang |

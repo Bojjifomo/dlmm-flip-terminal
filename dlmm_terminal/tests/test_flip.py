@@ -57,6 +57,7 @@ class FlipLoopTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.p = [mock.patch.object(web, "_flip_file", lambda: self.tmp / "flip.json"),
+                  mock.patch.object(web, "_auto_file", lambda: self.tmp / "auto_exit.json"),
                   mock.patch("dlmm_terminal.cli.append", lambda *a, **k: None),
                   mock.patch("dlmm_terminal.cli.notify", lambda *a, **k: None)]
         for x in self.p:
@@ -90,6 +91,46 @@ class FlipLoopTest(unittest.TestCase):
         with mock.patch("dlmm_terminal.cli.ticks_for_wallet", lambda w, now: []):
             web.flip_once(self.cfg, "W")
         self.assertIn("NEW", web.flip_load()["positions"])
+
+    def ladder(self, price):
+        """A 3-slice SOL ladder under the price: 0.7-0.9, 0.5-0.7, 0.3-0.5."""
+        return lambda w, now: [exits.Tick(f"S{i}", "POOL", "X", now, None, -3, None, price=price, range_min=lo, range_max=hi)
+                               for i, (lo, hi) in enumerate(((0.7, 0.9), (0.5, 0.7), (0.3, 0.5)), 1)]
+
+    def test_bids_wait_for_the_whole_ladder_then_flip_together(self):
+        web.flip_set("POOL", "X", "auto")
+        res = {"ok": True, "newPosition": "NEW", "range": {"lo": 1, "hi": 70}}
+        # price through slices 1 and 2 but still inside slice 3: nothing flips
+        with mock.patch("dlmm_terminal.cli.ticks_for_wallet", self.ladder(0.45)), mock.patch.object(web.node, "run") as run:
+            web.flip_once(self.cfg, "W")
+            run.assert_not_called()
+        st = web.flip_load()["positions"]["S1"]
+        self.assertFalse(st["ready"])
+        self.assertIn("seluruh ladder", st["msg"])
+        # under the bottom of slice 3: all three flip
+        with mock.patch("dlmm_terminal.cli.ticks_for_wallet", self.ladder(0.25)), \
+                mock.patch.object(web.node, "run", return_value=res) as run:
+            done = web.flip_once(self.cfg, "W")
+        self.assertEqual(sorted(x["position"] for x in done), ["S1", "S2", "S3"])
+
+    def test_whole_ladder_off_flips_per_slice(self):
+        web.flip_set("POOL", "X", "auto")
+        cfg = {"flip": {**self.cfg["flip"], "wholeLadder": False}}
+        with mock.patch("dlmm_terminal.cli.ticks_for_wallet", self.ladder(0.45)), \
+                mock.patch.object(web.node, "run", return_value={"ok": True, "newPosition": "N", "range": {"lo": 1, "hi": 2}}):
+            done = web.flip_once(cfg, "W")
+        self.assertEqual(sorted(x["position"] for x in done), ["S1", "S2"])
+
+    def test_a_flip_turns_the_tp_off(self):
+        web.flip_set("POOL", "X", "auto")
+        web.auto_set("POOL", "X", 5)
+        with mock.patch("dlmm_terminal.cli.ticks_for_wallet", self.ticks(0.2)), \
+                mock.patch.object(web.node, "run", return_value={"ok": True, "newPosition": "NEW", "range": {"lo": 1, "hi": 70}}):
+            web.flip_once(self.cfg, "W")
+        a = web.auto_load()["POOL"]
+        self.assertEqual(a["status"], "disarmed")
+        self.assertIn("flip", a["msg"])
+        self.assertFalse(web.auto_disarm("POOL", "again"))              # already off: nothing to do
 
     def test_alert_mode_waits_for_the_button(self):
         web.flip_set("POOL", "X", "alert")
