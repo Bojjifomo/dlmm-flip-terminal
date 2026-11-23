@@ -15,6 +15,7 @@ import path from "node:path";
 import { loadSigner } from "./keys.mjs";
 import { tradeConnection, rpcStats } from "./rpc.mjs";
 import { sellToSol } from "./swap.mjs";
+import { tokenHoldings } from "./txutil.mjs";
 import { progress } from "./progress.mjs";
 import { guardMain } from "./txutil.mjs";
 
@@ -63,13 +64,10 @@ for (const p of positions) {
     solLamports: solAmt, tokenRaw: tok, holdsToken: tok > 0 });
 }
 
+// owner index + a direct read of the associated account (the index can lag minutes behind a close)
 const tokenBalance = async () => {
-  let raw = 0n, dec = 0;
-  for (const programId of [new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")]) {
-    const r = await connection.getParsedTokenAccountsByOwner(owner, { mint: new PublicKey(tokenMint), programId });
-    for (const a of r.value) { const t = a.account.data.parsed.info.tokenAmount; raw += BigInt(t.amount); dec = t.decimals; }
-  }
-  return { raw, dec };
+  const h = await tokenHoldings(connection, owner, tokenMint);
+  return { raw: h.total, dec: h.decimals };
 };
 
 // SOL per whole token at the pool's active bin (pricePerToken is Y per X)
