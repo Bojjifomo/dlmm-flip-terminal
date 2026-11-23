@@ -100,9 +100,12 @@ for (const [ci, { position: p }] of view.entries()) {
 // seconds, so wait until it moves (up to ~30 s) when the positions held some token; if it never
 // shows, sell what the positions held, capped by what the wallet now holds.
 const expected = BigInt(Math.floor(view.reduce((a, v) => a + (Number(v.tokenRaw) || 0), 0)));
-if (expected > 0n) progress("nunggu token hasil close masuk ke wallet…");
+progress("cek token hasil close di wallet…");
 let tokAfter = await tokenBalance(), gained = tokAfter.raw - tokBefore.raw, waited = 0;
-while (expected > 0n && gained * 100n < expected * 95n && waited < 15) {
+// Wait while the token is short of what the positions held, and ALSO when nothing shows at all although we did
+// not expect any: the positions' own numbers can say 0 (price moved during the closes) while token came out
+// (FIONA / SIDOOR, 23-24 Nov: "nggak ada token buat dijual" with the token sitting in the wallet).
+while (((expected > 0n && gained * 100n < expected * 95n) || (expected === 0n && gained <= 0n && waited < 4)) && waited < 15) {
   await new Promise(r => setTimeout(r, 2000));
   waited++;
   tokAfter = await tokenBalance();
@@ -135,24 +138,31 @@ if (gained > 0n) {
     swap = { ok: false, error: res.error, tried: res.tried, leftover: { mint: tokenMint, pool, raw: gained.toString() } };
   } else {
     swap = { ok: true, signature: res.signature, via: res.via, tokenRaw: gained.toString(), sol: res.sol, underPct: res.underPct, note: gainedNote, waitedS: waited * 2 };
-    // Token of a slice whose close the RPC reported late (Singularity, 22 Nov: the third slice's 11.7k landed in
-    // the balance after the sale had started, and stayed in the wallet). Look again and sell what is left of
-    // this ladder's token (never what was in the wallet before the close).
-    for (let k = 0; k < 3; k++) {
-      await new Promise(r => setTimeout(r, 4000));
-      const extra = (await tokenBalance()).raw - tokBefore.raw;
-      if (extra <= 0n) break;
-      progress(`sisa token (${extra}) telat masuk: jual juga…`);
-      const r2 = await sellToSol(tokenMint, extra.toString(), { connection, signer, owner, maxLossPct: maxLoss, pool });
-      if (!r2.ok) {
-        swapError = `sisa token NOT sold: ${r2.error}. It stays in the wallet (Cleanup sells it later).`;
-        swap.leftover = { mint: tokenMint, pool, raw: extra.toString() };
-        break;
+  }
+}
+// Then look again, whatever happened above (sold, or nothing seen to sell): token of a slice whose close the RPC
+// reported late (Singularity 22 Nov: 11.7k landed after the sale began) or that no read saw in time is sold now.
+// Only this ladder's token: what the wallet holds beyond what it held before the close.
+if (swap === null || swap.ok) {
+  for (let k = 0; k < 3; k++) {
+    await new Promise(r => setTimeout(r, 4000));
+    const extra = (await tokenBalance()).raw - tokBefore.raw;
+    if (extra <= 0n) break;
+    progress(`${swap ? "sisa token" : "token"} (${extra}) ${swap ? "telat masuk" : "kebaca sekarang"}: jual…`);
+    const r2 = await sellToSol(tokenMint, extra.toString(), { connection, signer, owner, maxLossPct: maxLoss, pool });
+    if (!r2.ok) {
+      swapError = `${swap ? "sisa " : ""}token NOT sold: ${r2.error}. It stays in the wallet (Cleanup sells it later).`;
+      if (!reopen && !swap) {
+        out({ ok: false, step: "swap", error: `positions closed, ${swapError}`, closed, swap: r2, leftover: { mint: tokenMint, pool, raw: extra.toString() } });
+        process.exit(1);
       }
-      swap.sol = (Number(swap.sol) || 0) + (Number(r2.sol) || 0);
-      swap.tokenRaw = (BigInt(swap.tokenRaw) + extra).toString();
-      swap.extraSales = (swap.extraSales || 0) + 1;
+      swap = { ...(swap || { ok: false }), leftover: { mint: tokenMint, pool, raw: extra.toString() } };
+      break;
     }
+    if (!swap) swap = { ok: true, signature: r2.signature, via: r2.via, tokenRaw: "0", sol: 0, note: "token seen only after the first read" };
+    swap.sol = (Number(swap.sol) || 0) + (Number(r2.sol) || 0);
+    swap.tokenRaw = (BigInt(swap.tokenRaw) + extra).toString();
+    swap.extraSales = (swap.extraSales || 0) + 1;
   }
 }
 // What came back. The RPC can still show the balance from before the close / sale for a few
