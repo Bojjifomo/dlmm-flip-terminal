@@ -54,7 +54,7 @@
     "maxFlipsPer24h": 8,
     "gapBins": 1,
     "slippagePct": 1,
-    "minSolReserve": 0.05
+    "minSolReserve": 0.05, "wholeLadder": true, "_wholeLadder": "owner 23 Nov: bids flip only once the whole ladder is crossed (price under the last slice), then all together; false = per slice"
   },
   "exits": {
     "_note": "Spec section 4: every fixed TP / SL / trailing / time limit lost SOL vs. holding (TP +1/+2/+5/+10% = -7.16/-7.57/-4.37/-1.06 SOL). They stay null unless you turn them on.",

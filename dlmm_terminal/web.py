@@ -456,6 +456,23 @@ def auto_set(pool: str, symbol: str, pct: float | None) -> dict:
         return d
 
 
+def auto_disarm(pool: str, why: str) -> bool:
+    """Turn the TP off for a pool whose ladder was just flipped or re-entered: the new positions start a new PnL
+    (a flip realises the loss of the slice it closes and opens the rest at today's price), so a target set on the
+    old ladder would fire on a number that does not include that loss (Singularity, 23 Nov: TP fired at +8% on
+    the open positions while the ladder was −0.22 SOL). Returns True if a TP was armed."""
+    from .cli import notify
+    with _auto_lock:
+        d = auto_load()
+        a = d.get(pool)
+        if not a or a.get("status") != "armed":
+            return False
+        d[pool] = {**a, "status": "disarmed", "msg": f"TP +{a['pct']:g}% dimatiin otomatis: {why}", "disarmedAt": time.time()}
+        auto_save(d)
+    notify(f"🎯 TP {a.get('symbol') or pool[:6]} +{a['pct']:g}% dimatiin: {why}. Nyalain lagi di Portfolio kalau mau.")
+    return True
+
+
 def _ladders(wallet: str) -> dict:
     """{pool: {"symbol", "positions": [...], "pnlSol", "depositSol", "pnlPct"}} from Meteora's data API."""
     from .cli import ticks_for_wallet
@@ -665,6 +682,8 @@ def flip_run(cfg: dict, pool: str, position: str, to: str, symbol: str = "", for
                                "symbol": symbol, "position": position, "to": to,
                                **{k: res.get(k) for k in ("ok", "error", "step", "newPosition", "range", "depositSol", "depositToken", "signatures")}})
         notify(f"{'🔁' if ok else '❌'} FLIP {symbol or pool[:6]}: {msg}")
+    if ok:
+        auto_disarm(pool, "ladder di-flip")
     return res
 
 
@@ -681,11 +700,20 @@ def flip_once(cfg: dict, wallet: str) -> list[dict]:
     ticks = [t for t in ticks_for_wallet(wallet, now) if t.pool in armed]
     with _auto_lock:
         d = flip_load()
+        # every position's own decision first, then the pool-level rule: bids flip only when the whole ladder is crossed
+        per_pool: dict = {}
         for t in ticks:
-            seen.add(t.position)
             raw = d["positions"].get(t.position) or {"pool": t.pool}
             st = flip.FlipState.from_dict(raw)
             dec = flip.evaluate(now, t.price, t.range_min, t.range_max, t.sol_only, st, fc, flip.flips_24h(d, t.pool, now))
+            per_pool.setdefault(t.pool, []).append((t, raw, st, dec))
+        decided = []
+        for pool, items in per_pool.items():
+            bids = [t.range_min for t, _, st, _ in items if st.side == "bid"]
+            gated = flip.ladder_gate([(st.side, dec) for _, _, st, dec in items], items[0][0].price, min(bids) if bids else None, fc)
+            decided += [(t, raw, st, g) for (t, raw, st, _), g in zip(items, gated)]
+        for t, raw, st, dec in decided:
+            seen.add(t.position)
             raw.update(st.to_dict(), pool=t.pool, msg=dec.msg, ready=dec.kind == "flip", to=dec.to)
             if dec.kind == "wait":
                 raw.pop("error", None)
@@ -828,6 +856,8 @@ def reentry_once(cfg: dict, wallet: str) -> list[dict]:
                 d["pools"][pool].update(status="armed" if ok else "failed", lastAt=now, checks=0, msg=msg)
             d["history"] = d["history"][-199:] + [{"pool": pool, "symbol": sym, "at": now, "ok": ok, "msg": msg}]
             reentry_save(d)
+        if ok:
+            auto_disarm(pool, "auto re-entry buka ladder baru")
         append("closes.jsonl", {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "source": "auto-reentry",
                                 "pool": pool, "symbol": sym, "positions": [s["position"] for s in slices], "rule": "reentry above range",
                                 **{k: res.get(k) for k in ("ok", "error", "step", "solBack", "reopenSol", "landedSlices")}})
@@ -912,6 +942,35 @@ def _trade_title(path: str, body: dict) -> str:
     return f"Close {sym}"
 
 
+def _notify_trade(title: str, res: dict) -> None:
+    """Telegram (when DLMM_TG_BOT_TOKEN / DLMM_TG_CHAT_ID are set): every trade from the web too, not only the auto ones."""
+    from .cli import notify
+    if title.startswith("Flip"):                  # flip_run sends its own message
+        return
+    try:
+        if res.get("ok"):
+            bits = []
+            if res.get("reopenSol") is not None:
+                bits.append(f"buka lagi ◎{res['reopenSol']}")
+            if res.get("solBack") is not None:
+                bits.append(f"◎{float(res['solBack']):.4f} balik")
+            sw = res.get("swap") or {}
+            if sw.get("ok") and sw.get("sol"):
+                bits.append(f"token dijual ◎{float(sw['sol']):.4f}")
+            if res.get("results"):
+                ok_n = sum(1 for r in res["results"] if r.get("ok"))
+                bits.append(f"{ok_n}/{len(res['results'])} slice kebuka")
+            if res.get("sol") and res.get("via"):
+                bits.append(f"◎{float(res['sol']):.4f} via {res['via']}")
+            if res.get("warning"):
+                bits.append("⚠ " + str(res["warning"])[:120])
+            notify(f"✅ {title}" + (": " + " · ".join(bits) if bits else ""))
+        elif not res.get("busy"):
+            notify(f"❌ {title}: {(res.get('step') or '')} {str(res.get('error') or 'gagal')[:200]}")
+    except Exception:
+        pass
+
+
 def _trade_exec(path: str, cfg: dict, body: dict) -> dict:
     """What /api/trade/* does (open, flip, sell, cleanup, reenter, close): returns the executor's result."""
     from .cli import append
@@ -970,6 +1029,8 @@ def _trade_exec(path: str, cfg: dict, body: dict) -> dict:
             _reenter_lock.release()
         append("closes.jsonl", {"ts": ts, "source": "web", "pool": body.get("pool"), "symbol": body.get("symbol"),
                                 "positions": positions, "rule": "reenter" if body.get("reopen") else "close-swap", **{k: res.get(k) for k in ("ok", "error", "step", "solBack", "reopenSol")}})
+        if body.get("reopen") and res.get("ok"):
+            auto_disarm(str(body["pool"]), "re-entry buka ladder baru")
         return res
     res = node.run("close_position.mjs", ["--pool", str(body["pool"]), "--position", str(body["position"])], timeout=300)
     append("closes.jsonl", {"ts": ts, "source": "web", "pool": body.get("pool"), "symbol": body.get("symbol"),
@@ -1117,12 +1178,14 @@ class Handler(BaseHTTPRequestHandler):
                             except Exception as exc:
                                 res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                             node.job_finish(job, res)
+                        _notify_trade(title, res)
                     threading.Thread(target=work, daemon=True).start()
                     return self._json({"ok": True, "jobId": job["id"], "title": title})
                 job = node.job_start(title)
                 with node.job_context(job):
                     res = _trade_exec(self.path, self.cfg, body)
                 node.job_finish(job, res)
+                _notify_trade(title, res)
                 return self._json(res)
             if self.path == "/api/review":
                 # read-only analysis (Meteora API, no key, no RPC): the trade header against other sites, no PIN

@@ -762,6 +762,7 @@ function autoExitCell(p, pnlPct) {
   else if (a && a.status === "selling") st = `<span class="tp warn">⏳ ${esc(a.msg || "token lagi dicoba jual")}</span>`;
   else if (a && a.status === "done") st = `<span class="tp pos">✓ auto exit: ${esc(a.msg || "")} ${clearBtn(p.pool)}</span>`;
   else if (a && a.status === "failed") st = `<span class="tp neg">✗ auto exit gagal: ${esc(a.msg || "")} ${clearBtn(p.pool)}</span>`;
+  else if (a && a.status === "disarmed") st = `<span class="tp muted">🎯 ${esc(a.msg || "TP dimatiin")} ${clearBtn(p.pool)}</span>`;
   return `<div class="tpbox"><select class="tpsel" data-tp="${p.pool}" data-sym="${esc(p.symbol)}" title="Auto exit: close semua slice + jual token ke SOL saat PnL ladder ≥ target. Dicek server tiap ${state.pf.autoExitCheckMin || 2} menit (tanpa RPC) selama DLMM Web jalan.">${opts}</select>${st}</div>`;
 }
 // A finished / failed auto exit stays on the row until it is cleared (the select already reads "off", so it can't).
