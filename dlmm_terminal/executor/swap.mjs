@@ -148,7 +148,9 @@ async function sellToSolInner(mint, rawAmount, opts) {
   };
 
   // --- one Jupiter attempt: quote -> guard -> build -> simulate -> send
-  async function jup(amount, extra, label) {
+  // pri: Jupiter's priority level; a resend after an expiry goes out at veryHigh (up to 0.005 SOL) so it lands
+  // when the network is busy (FIONA, 24 Nov: the first sale expired, the resend at the same fee waited 12 min).
+  async function jup(amount, extra, label, pri = "high") {
     const qs = `inputMint=${mint}&outputMint=${WSOL}&amount=${amount}&slippageBps=300${extra.excludeDexes ? "&excludeDexes=" + encodeURIComponent(extra.excludeDexes) : ""}${extra.onlyDirectRoutes ? "&onlyDirectRoutes=true" : ""}`;
     const q = await getJson(`${jupBase()}/quote?${qs}`, { headers: jupHeaders() });
     if (!q.outAmount) throw new Error("no route" + (q.error ? ` (${q.error})` : ""));
@@ -160,7 +162,7 @@ async function sellToSolInner(mint, rawAmount, opts) {
     if (dry && !verify) return { ...out, dryRun: true };
     const sw = await getJson(`${jupBase()}/swap`, { method: "POST", headers: jupHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ quoteResponse: q, userPublicKey: owner.toBase58(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: { priorityLevelWithMaxLamports: { maxLamports: 2_000_000, priorityLevel: "high" } } }) }, 2);
+        prioritizationFeeLamports: { priorityLevelWithMaxLamports: { maxLamports: pri === "veryHigh" ? 5_000_000 : 2_000_000, priorityLevel: pri } } }) }, 2);
     if (!sw.swapTransaction) { const e = new Error("swap build failed: " + clip(JSON.stringify(sw), 200)); e.labels = labels; throw e; }
     const tx = VersionedTransaction.deserialize(Buffer.from(sw.swapTransaction, "base64"));
     const sim = await connection.simulateTransaction(tx, { sigVerify: false, replaceRecentBlockhash: true, commitment: "confirmed" });
@@ -224,7 +226,7 @@ async function sellToSolInner(mint, rawAmount, opts) {
     if (r.res) return r.res;
     const labels = r.err.labels || [];
     const noMarket = /not tradable|No routes found|no route/i.test(String(r.err.message));
-    if (r.err.expired) { const r2 = await attempt("Jupiter kirim ulang", () => jup(amount, {}, "(kirim ulang)")); if (r2.res) return r2.res; }
+    if (r.err.expired) { const r2 = await attempt("Jupiter kirim ulang (fee lebih tinggi)", () => jup(amount, {}, "(kirim ulang)", "veryHigh")); if (r2.res) return r2.res; }
     if (!noMarket && labels.length) {
       const r3 = await attempt(`Jupiter tanpa ${labels.join("+")}`, () => jup(amount, { excludeDexes: labels.join(",") }, `(tanpa ${labels.join("+")})`));
       if (r3.res) return r3.res;
