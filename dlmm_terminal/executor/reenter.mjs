@@ -9,11 +9,11 @@
 //
 // Without --reopen it is "close and swap to SOL". One JSON line on stdout. Needs the trading key (not --dry-run).
 import { createRequire } from "node:module";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { loadSigner } from "./keys.mjs";
-import { tradeConnection, rpcStats } from "./rpc.mjs";
+import { tradeConnection, rpcStats, noteTx } from "./rpc.mjs";
 import { sellToSol } from "./swap.mjs";
 import { tokenHoldings } from "./txutil.mjs";
 import { progress } from "./progress.mjs";
@@ -35,6 +35,17 @@ function child(script, args) {
   // stderr passes through, so the child's "@@" progress lines reach DLMM Web's activity panel too
   try { return lastJson(execFileSync("node", [path.join(here, script), ...args], { encoding: "utf8", maxBuffer: 1e8, env: process.env, stdio: ["ignore", "pipe", "inherit"] })); }
   catch (e) { return lastJson(String(e.stdout || "")) || { ok: false, error: String(e.stderr || e.message).slice(-300) }; }
+}
+
+// the same, without blocking: several closes run at once
+function childAsync(script, args) {
+  return new Promise(resolve => {
+    let out = "";
+    const p = spawn("node", [path.join(here, script), ...args], { env: process.env, stdio: ["ignore", "pipe", "inherit"] });
+    p.stdout.on("data", d => { out += d; });
+    p.on("error", e => resolve({ ok: false, error: String(e.message || e).slice(0, 300) }));
+    p.on("close", code => { let j = null; try { j = lastJson(out); } catch {} resolve(j || { ok: false, error: `close_position exit ${code}` }); });
+  });
 }
 
 const pool = arg("pool"), positions = (arg("positions") || "").split(",").filter(Boolean);
@@ -89,13 +100,25 @@ const solBefore = await connection.getBalance(owner);
 const tokBefore = await tokenBalance();
 const closed = gone.map(p => ({ position: p, ok: true, alreadyClosed: true }));
 progress(`close ${view.length} slice${view.length > 1 ? "s" : ""}${reopen ? " → jual token → buka lagi" : " → jual token"}`);
-for (const [ci, { position: p }] of view.entries()) {
-  progress(`close slice ${ci + 1}/${view.length} (${p.slice(0, 6)}…)`);
-  const r = child("close_position.mjs", ["--pool", pool, "--position", p]);
-  progress(r?.ok ? `✓ slice ${ci + 1}/${view.length} ditutup` : `✗ slice ${ci + 1}/${view.length} gagal ditutup: ${String(r?.error || "?").slice(0, 120)}`, { ok: !!r?.ok });
-  closed.push({ position: p, ok: !!r?.ok, error: r?.error });
-  if (!r?.ok) { out({ ok: false, step: "close", error: `close ${p} failed: ${r?.error || "?"}`, closed }); process.exit(1); }
-}
+// Each slice is its own position (and lock), so up to DLMM_PARALLEL_SLICES of them close at once.
+const PAR = Math.max(1, Number(process.env.DLMM_PARALLEL_SLICES || 3) || 1);
+const tClose = Date.now();
+const closeRes = new Array(view.length);
+let nextClose = 0;
+await Promise.all(Array.from({ length: Math.min(PAR, view.length) }, async () => {
+  while (nextClose < view.length) {
+    const ci = nextClose++, p = view[ci].position;
+    progress(`close slice ${ci + 1}/${view.length} (${p.slice(0, 6)}…)`);
+    const r = await childAsync("close_position.mjs", ["--pool", pool, "--position", p]);
+    progress(r?.ok ? `✓ slice ${ci + 1}/${view.length} ditutup` : `✗ slice ${ci + 1}/${view.length} gagal ditutup: ${String(r?.error || "?").slice(0, 120)}`, { ok: !!r?.ok });
+    closeRes[ci] = { position: p, ok: !!r?.ok, error: r?.error, tx: r?.rpc?.tx };
+  }
+}));
+closed.push(...closeRes.map(({ tx, ...c }) => c));
+for (const c of closeRes) for (const t of c.tx || []) noteTx(t);          // the closes' timings, in this run's log
+progress(`close ${view.length} slice selesai dalam ${((Date.now() - tClose) / 1000).toFixed(0)}s`);
+const badClose = closeRes.find(c => !c.ok);
+if (badClose) { out({ ok: false, step: "close", error: `close ${badClose.position} failed: ${badClose.error || "?"}`, closed }); process.exit(1); }
 // The token that came out. The RPC can answer with the balance from before the close for a few
 // seconds, so wait until it moves (up to ~30 s) when the positions held some token; if it never
 // shows, sell what the positions held, capped by what the wallet now holds.
@@ -189,6 +212,7 @@ if (!(ask >= 0.01)) { out({ ok: false, step: "reopen", error: `only ${back.toFix
 progress(`buka ladder lagi: ◎${ask} · ${arg("slices", "5")} slice sampai −${arg("bottom", "70")}%`);
 const opened = child("open_ladder.mjs", ["--pool", pool, "--sol", String(ask), "--slices", arg("slices", "5"), "--bottom", arg("bottom", "70"),
   "--top", arg("top", "0"), "--strategy", arg("strategy", "spot")]);
+for (const t of opened?.rpc?.tx || []) noteTx(t);
 const landed = (opened?.results || []).filter(x => x && x.ok).length;
 out({ ok: !!opened?.ok, mode: "reenter", closed, swap, swapError, solBack: back, ladderSol: +expectSol.toFixed(4), reopenSol: ask, opened, landedSlices: landed,
   ...(opened?.ok ? {} : { step: "reopen", error: (landed ? `re-opened ${landed} slice(s) only: ` : "re-open failed, the SOL is in the wallet: ") + (opened?.error || "?") }),

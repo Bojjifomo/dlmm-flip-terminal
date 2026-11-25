@@ -100,7 +100,7 @@ if (!dryRun) {
         const list = round === 0 ? txs : (await dlmm.refetchStates(), await buildTxs());
         try {
           for (const [i, tx] of list.entries()) {
-            const sig = await sendLegacy(connection, tx, [signer]);
+            const sig = await sendLegacy(connection, tx, [signer], { label: `close ${positionAddr.slice(0, 4)}${list.length > 1 ? ` ${i + 1}/${list.length}` : ""}` });
             console.log(`  tx ${i + 1}: ${sig}`);
             sigs.push(sig);
           }

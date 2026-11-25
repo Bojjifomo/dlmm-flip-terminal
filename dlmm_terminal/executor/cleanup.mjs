@@ -99,7 +99,7 @@ if (!flag("no-close") && !dry) {
       tx.add(new TransactionInstruction({ programId: new PublicKey(a.program), data: Buffer.from([9]),
         keys: [{ pubkey: a.address, isSigner: false, isWritable: true }, { pubkey: owner, isSigner: false, isWritable: true }, { pubkey: owner, isSigner: true, isWritable: false }] }));
     }
-    try { await sendLegacy(connection, tx, [signer]); closed += Math.min(8, empties.length - i); }
+    try { await sendLegacy(connection, tx, [signer], { label: "tutup akun kosong" }); closed += Math.min(8, empties.length - i); }
     catch (e) { out({ ok: false, error: "close accounts: " + String(e.message || e).slice(0, 200), tokens, closed }); process.exit(1); }
   }
 }

@@ -69,5 +69,15 @@
     "trailingPts": null,
     "trailingArmPct": 1,
     "maxHoldMin": null
+  },
+  "tx": {
+    "_note": "How transactions are sent (open, close, flip, cleanup; Jupiter sales keep Jupiter's own fee). Nov 2026: a fixed 50k microlamport fee and web3's passive confirm made each transaction wait ~30-40 s.",
+    "priorityLevel": "High", "_priorityLevel": "Helius getPriorityFeeEstimate level: Medium | High | VeryHigh. A resend after an expiry goes one level up.",
+    "maxFeeSol": 0.001, "_maxFeeSol": "cap on the priority fee of ONE transaction (owner, 25 Nov 2026)",
+    "minMicroLamports": 50000,
+    "sender": "swqos", "_sender": "Helius Sender: swqos (tip senderTipSol, min 0.000005) | max (all routes incl. Jito, tip min 0.001 SOL) | off",
+    "senderTipSol": 0.00001,
+    "rebroadcastSec": 2,
+    "parallelSlices": 3, "_parallelSlices": "slices opened / closed at once; 1 = one after another like before"
   }
 }

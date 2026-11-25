@@ -13,6 +13,15 @@ const { Connection } = require("@solana/web3.js");
 
 export const PUBLIC_RPC = "https://api.mainnet-beta.solana.com";
 const stats = { calls: 0, byHost: {}, byMethod: {} };
+// one row per transaction sent (txutil.landTx): how long it took to land, how often it was broadcast, what it paid
+const txRows = [];
+export const noteTx = row => { txRows.push(row); };
+// requests that do not go through a Connection (Helius Sender): counted under their own label
+export function countCall(host, method) {
+  stats.calls++;
+  stats.byHost[host] = (stats.byHost[host] || 0) + 1;
+  stats.byMethod[method] = (stats.byMethod[method] || 0) + 1;
+}
 
 const label = url => {
   try {
@@ -53,5 +62,5 @@ export async function withReadConnection(fn) {
   }
 }
 
-export const rpcStats = () => stats;
+export const rpcStats = () => (txRows.length ? { ...stats, tx: txRows } : stats);
 export const connectionFor = url => make(url);

@@ -109,7 +109,7 @@ async function flip({ connection, dlmm, signer, owner, positionPk, plan, tokenIs
         toBinId: p.positionData.upperBinId, bps: new BN(10_000), shouldClaimAndClose: true });
       for (const tx of txs) {
         tx.instructions.unshift(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
-        sigs.push(await sendLegacy(connection, tx, [signer]));
+        sigs.push(await sendLegacy(connection, tx, [signer], { label: "flip: close" }));
       }
     } catch (e) {
       await sleep(2000);
@@ -163,7 +163,7 @@ async function flip({ connection, dlmm, signer, owner, positionPk, plan, tokenIs
     for (const [i, tx] of txs.entries()) {
       tx.instructions.unshift(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
       const signers = i === 0 ? [signer, posKp] : [signer];
-      try { sigs.push(await sendLegacy(connection, tx, signers)); }
+      try { sigs.push(await sendLegacy(connection, tx, signers, { label: `flip: buka ${to}` })); }
       catch (e) {
         // a create that landed although the send errored: do not report it as failed (and never open it twice)
         if (i === 0 && (await connection.getAccountInfo(posKp.publicKey, "confirmed"))) { sigs.push("(landed)"); continue; }

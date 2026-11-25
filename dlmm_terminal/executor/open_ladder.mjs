@@ -19,7 +19,7 @@ import { createRequire } from "node:module";
 import { progress } from "./progress.mjs";
 const require = createRequire(import.meta.url);
 const DLMMmod = require("@meteora-ag/dlmm");
-const { Connection, Keypair, PublicKey, sendAndConfirmTransaction, ComputeBudgetProgram } = require("@solana/web3.js");
+const { Connection, Keypair, PublicKey, Transaction, ComputeBudgetProgram } = require("@solana/web3.js");
 const BN = require("bn.js");
 const DLMM = DLMMmod.default ?? DLMMmod;
 const { StrategyType } = DLMMmod;
@@ -102,7 +102,7 @@ if (balance < need && mode !== "build") {
 }
 
 // ---- build one slice's transactions from the pool's CURRENT state -------------------------------------------
-async function buildSlice(s, posKp) {
+async function buildSlice(s, posKp, dl = dlmm) {
   const params = {
     positionPubKey: posKp.publicKey, user: owner,
     totalXAmount: new BN(solIsX ? s.lamports.toString() : "0"),
@@ -111,13 +111,13 @@ async function buildSlice(s, posKp) {
     slippage: slippagePct,
   };
   let txs;
-  if (s.width <= 70) txs = [await dlmm.initializePositionAndAddLiquidityByStrategy(params)];
+  if (s.width <= 70) txs = [await dl.initializePositionAndAddLiquidityByStrategy(params)];
   else {
     // wider than a standard position: create it extended, then fill it chunk by chunk
-    const create = await dlmm.createExtendedEmptyPosition(s.lo, s.hi, posKp.publicKey, owner);
-    txs = [create, ...(await dlmm.addLiquidityByStrategyChunkable(params))];
+    const create = await dl.createExtendedEmptyPosition(s.lo, s.hi, posKp.publicKey, owner);
+    txs = [create, ...(await dl.addLiquidityByStrategyChunkable(params))];
   }
-  // A little priority so it lands on a busy minute.
+  // A little priority for the wallet-signed (--build) transactions; sendLegacy prices the ones sent here.
   for (const tx of txs) tx.instructions.unshift(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
   return txs;
 }
@@ -128,10 +128,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const TRANSIENT = /blockhash not found|block height exceeded|expired|timed? ?out|429|too many requests|fetch failed|ECONN|ETIMEDOUT|socket hang up|not confirmed|node is behind|503|502|504|service unavailable|rate limit/i;
 // Resends only a transaction that is known not to have landed (expired blockhash); one whose confirmation merely
 // timed out is looked up on chain first. Resending a landed "create position" used to open the slice twice.
-async function sendWithRetry(tx, signersFor) {
+async function sendWithRetry(tx, signersFor, label = "") {
   tx.feePayer = owner;
   const signers = typeof signersFor === "function" ? signersFor(tx) : signersFor;
-  return sendLegacy(connection, tx, signers, { simulate: false });
+  return sendLegacy(connection, tx, signers, { simulate: false, label });
 }
 // Is the whole slice still on SOL's side of the price? (SOL-only below the price when SOL is Y, above it when SOL is X.)
 // The active bin itself may hold SOL only (the top slice starts there), so the comparison is not strict.
@@ -167,33 +167,50 @@ if (mode === "dry-run" || mode === "build") {
   process.exit(okAll ? 0 : 1);
 }
 
-// ---- send: slice by slice, each built right before it is sent --------------------------------------------------
-// Building every slice up front (as this did) leaves the later slices with a price and bin-array picture that is
-// minutes old; on a fast token the program then refuses them (bin slippage) and the ladder stops after the first
-// slice. Now every slice is built from fresh state, a failed transaction is retried, a failed slice does not
-// block the next one, and what did not open is reported with everything needed to open it again.
-const results = [], failedSlices = [];
-let strikes = 0;
-progress(`buka ${plan.slices.length} slice · ◎${(Number(plan.slices.reduce((a, s) => a + BigInt(s.lamports), 0n)) / 1e9).toFixed(3)}`);
-for (const [i, s] of plan.slices.entries()) {
+// ---- send: every slice built right before it is sent, several slices at once ------------------------------------
+// Building every slice up front (as this once did) leaves the later slices with a price and bin-array picture that is
+// minutes old; on a fast token the program then refuses them (bin slippage). Every slice is built from fresh state, a
+// failed transaction is retried, a failed slice does not block the others, and what did not open is reported with
+// everything needed to open it again. Up to DLMM_PARALLEL_SLICES (config tx.parallelSlices, default 3) slices go at
+// once, each with its own copy of the pool state; the bin arrays the ladder needs are created first, in one place,
+// so two slices never race to create the same one.
+const total = plan.slices.length;
+let PAR = Math.max(1, Math.min(Number(process.env.DLMM_PARALLEL_SLICES || 3) || 1, total));
+progress(`buka ${total} slice · ◎${(Number(plan.slices.reduce((a, s) => a + BigInt(s.lamports), 0n)) / 1e9).toFixed(3)}${PAR > 1 ? ` · ${PAR} sekaligus` : ""}`);
+
+if (PAR > 1) {
+  try {
+    const lo = Math.min(...plan.slices.map(s => s.lo)), hi = Math.max(...plan.slices.map(s => s.hi));
+    const ixs = (await dlmm.initializeBinArrays(DLMMmod.getBinArrayIndexesCoverage(new BN(lo), new BN(hi)), owner))
+      .filter(ix => ix.programId.toBase58() !== ComputeBudgetProgram.programId.toBase58());
+    for (let k = 0; k < ixs.length; k += 3) {
+      progress(`siapin bin array ${Math.min(k + 3, ixs.length)}/${ixs.length} (sekali per range, rent-nya sama kayak biasa)`);
+      await sendLegacy(connection, new Transaction().add(...ixs.slice(k, k + 3)), [signer], { label: "bin array" });
+    }
+  } catch (e) {
+    PAR = 1;                                                          // fall back to one slice at a time
+    progress(`bin array belum siap (${String(e.message || e).slice(0, 100)}): buka satu-satu`, { ok: false });
+  }
+}
+
+async function openSlice(i, s, dl) {
   const r = { slice: i + 1, lo: s.lo, hi: s.hi, sol: Number(s.lamports) / 1e9, ...(s.width > 70 ? { extended: s.width } : {}) };
-  results.push(r);
   let done = false, lastErr = null;
   for (let attempt = 1; attempt <= 3 && !done; attempt++) {
-    progress(`slice ${i + 1}/${plan.slices.length}: ◎${(Number(s.lamports) / 1e9).toFixed(3)} bin ${s.lo}..${s.hi}${attempt > 1 ? ` · coba lagi (${attempt}/3)` : ""}`);
+    progress(`slice ${i + 1}/${total}: ◎${(Number(s.lamports) / 1e9).toFixed(3)} bin ${s.lo}..${s.hi}${attempt > 1 ? ` · coba lagi (${attempt}/3)` : ""}`);
     const posKp = Keypair.generate();
     let created = false, sigs = [], txs = [];
     try {
-      await dlmm.refetchStates();
-      const act = await dlmm.getActiveBin();
+      await dl.refetchStates();
+      const act = await dl.getActiveBin();
       if (!sliceOk(s, act.binId)) throw Object.assign(new Error(`price moved: the active bin is now ${act.binId}, this slice (${s.lo}..${s.hi}) is no longer on SOL's side`), { final: true });
-      txs = await buildSlice(s, posKp);
+      txs = await buildSlice(s, posKp, dl);
       r.position = posKp.publicKey.toBase58(); r.txs = txs.length;
       for (let j = 0; j < txs.length; j++) {
         let tx = txs[j];
         for (let tryJ = 0; ; tryJ++) {
           try {
-            sigs.push(await sendWithRetry(tx, t => (needsPos(t, posKp) ? [signer, posKp] : [signer])));
+            sigs.push(await sendWithRetry(tx, t => (needsPos(t, posKp) ? [signer, posKp] : [signer]), `slice ${i + 1}${txs.length > 1 ? ` tx ${j + 1}/${txs.length}` : ""}`));
             if (j === 0) created = true;
             break;
           } catch (e) {
@@ -201,26 +218,25 @@ for (const [i, s] of plan.slices.entries()) {
             // send chunk j again (amounts per bin do not depend on the price while the range is on SOL's side).
             if (j === 0 || tryJ >= 2) throw e;
             await sleep(2000);
-            await dlmm.refetchStates();
-            const act2 = await dlmm.getActiveBin();
+            await dl.refetchStates();
+            const act2 = await dl.getActiveBin();
             if (!sliceOk(s, act2.binId)) throw Object.assign(e, { final: true });
-            const fresh = await dlmm.addLiquidityByStrategyChunkable({
+            const fresh = await dl.addLiquidityByStrategyChunkable({
               positionPubKey: posKp.publicKey, user: owner,
               totalXAmount: new BN(solIsX ? s.lamports.toString() : "0"), totalYAmount: new BN(solIsX ? "0" : s.lamports.toString()),
               strategy: { minBinId: s.lo, maxBinId: s.hi, strategyType, ...(solIsX ? { singleSidedX: true } : {}) }, slippage: slippagePct });
             if (fresh.length !== txs.length - 1) throw e;           // the chunking changed: do not guess
             tx = fresh[j - 1];
-            tx.instructions.unshift(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
           }
         }
       }
       r.signature = sigs[sigs.length - 1]; r.signatures = sigs; r.ok = true; r.attempts = attempt;
       done = true;
-      progress(`✓ slice ${i + 1}/${plan.slices.length} kebuka`, { ok: true });
+      progress(`✓ slice ${i + 1}/${total} kebuka`, { ok: true });
     } catch (e) {
       lastErr = e;
       r.error = errText(e);
-      progress(`✗ slice ${i + 1}/${plan.slices.length}: ${String(r.error).slice(0, 140)}`, { ok: false });
+      progress(`✗ slice ${i + 1}/${total}: ${String(r.error).slice(0, 140)}`, { ok: false });
       // The create may have landed although the send reported an error: never open the slice a second time.
       if (!created && r.position && (await connection.getAccountInfo(posKp.publicKey, "confirmed").catch(() => null))) {
         created = true;
@@ -232,8 +248,8 @@ for (const [i, s] of plan.slices.entries()) {
         if (funded) { r.partial = true; r.position = posKp.publicKey.toBase58(); break; }   // some liquidity is in: keep it, report it
         // created but empty: close it so its rent comes back, then try the slice again from scratch
         try {
-          const cl = await dlmm.closePosition({ owner, position: await dlmm.getPosition(posKp.publicKey) });
-          await sendWithRetry(cl, [signer]);
+          const cl = await dl.closePosition({ owner, position: await dl.getPosition(posKp.publicKey) });
+          await sendWithRetry(cl, [signer], `slice ${i + 1} tutup kosong`);
         } catch (ce) { r.orphan = posKp.publicKey.toBase58(); r.orphanError = errText(ce); break; }
       } else if (created) { r.orphan = posKp.publicKey.toBase58(); break; }
       if (e.final) break;
@@ -243,19 +259,34 @@ for (const [i, s] of plan.slices.entries()) {
   if (!done) {
     r.ok = false;
     r.error = (r.error || errText(lastErr)) + (r.partial ? ` (only part of it is in: position ${r.position})` : r.orphan ? ` (empty position ${r.orphan} left: close it)` : "");
-    if (!r.partial) failedSlices.push({ slice: i + 1, lo: s.lo, hi: s.hi, lamports: s.lamports.toString(), width: s.width, error: r.error });
-    strikes++;
-    if (strikes >= 2 && i < plan.slices.length - 1) {                 // two in a row: something is wrong, stop here
-      r.note = "stopped after two slices in a row failed";
-      break;
-    }
-  } else strikes = 0;
+  }
+  return r;
 }
-// slices never tried (stopped early) count as failed too, so they can be opened again
-for (let i = results.length; i < plan.slices.length; i++) {
-  const s = plan.slices[i];
-  failedSlices.push({ slice: i + 1, lo: s.lo, hi: s.hi, lamports: s.lamports.toString(), width: s.width, error: "not tried (an earlier slice kept failing)" });
+
+const results = new Array(total);
+const t0 = Date.now();
+if (PAR === 1) {
+  let strikes = 0;
+  for (const [i, s] of plan.slices.entries()) {
+    const r = results[i] = await openSlice(i, s, dlmm);
+    strikes = r.ok ? 0 : strikes + 1;
+    if (strikes >= 2 && i < total - 1) { r.note = "stopped after two slices in a row failed"; break; }
+  }
+} else {
+  let next = 0;
+  await Promise.all(Array.from({ length: PAR }, async (_, w) => {
+    const dl = w === 0 ? dlmm : await DLMM.create(connection, new PublicKey(pool));   // own pool state per worker
+    while (next < total) { const i = next++; results[i] = await openSlice(i, plan.slices[i], dl); }
+  }));
 }
-const okAll = results.length === plan.slices.length && results.every(r => r.ok);
-out({ ok: okAll, mode, plan: summary, results, ...(failedSlices.length ? { failedSlices } : {}) });
+const failedSlices = [];
+for (let i = 0; i < total; i++) {
+  const s = plan.slices[i], r = results[i];
+  if (!r) failedSlices.push({ slice: i + 1, lo: s.lo, hi: s.hi, lamports: s.lamports.toString(), width: s.width, error: "not tried (an earlier slice kept failing)" });
+  else if (!r.ok && !r.partial) failedSlices.push({ slice: i + 1, lo: s.lo, hi: s.hi, lamports: s.lamports.toString(), width: s.width, error: r.error });
+}
+const done = results.filter(Boolean);
+const okAll = done.length === total && done.every(r => r.ok);
+progress(`${okAll ? "✓" : "⚠"} ${done.filter(r => r.ok).length}/${total} slice kebuka dalam ${((Date.now() - t0) / 1000).toFixed(0)}s`, { ok: okAll });
+out({ ok: okAll, mode, plan: summary, results: done, parallel: PAR, seconds: Math.round((Date.now() - t0) / 1000), ...(failedSlices.length ? { failedSlices } : {}) });
 process.exit(okAll ? 0 : 1);
