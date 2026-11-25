@@ -144,6 +144,15 @@ const DEFAULTS = {
     "trailingPts": null,
     "trailingArmPct": 1,
     "maxHoldMin": null
+  },
+  "tx": {
+    "priorityLevel": "High",
+    "maxFeeSol": 0.001,
+    "minMicroLamports": 50000,
+    "sender": "swqos",
+    "senderTipSol": 1e-05,
+    "rebroadcastSec": 2,
+    "parallelSlices": 3
   }
 };
 //__DEFAULTS_END__

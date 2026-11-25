@@ -12,7 +12,8 @@ import { fileURLToPath } from "node:url";
 const require = createRequire(import.meta.url);
 const DLMMmod = require("@meteora-ag/dlmm");
 const { PublicKey, VersionedTransaction, ComputeBudgetProgram } = require("@solana/web3.js");
-import { confirmOrCheck, sendLegacy, withLock, tokenHoldings, consolidateToAta } from "./txutil.mjs";
+import { landTx, sendLegacy, withLock, tokenHoldings, consolidateToAta } from "./txutil.mjs";
+const bs58 = (() => { const m = require("bs58"); return m.default ?? m; })();
 const BN = require("bn.js");
 const DLMM = DLMMmod.default ?? DLMMmod;
 
@@ -169,11 +170,14 @@ async function sellToSolInner(mint, rawAmount, opts) {
     if (sim.value.err) { const e = new Error(`simulation failed via ${labels.join("+")}: ${simErr(sim)}`); e.labels = labels; throw e; }
     if (dry) return { ...out, dryRun: true, simulated: true };
     tx.sign([signer]);
-    const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
+    const sig = bs58.encode(tx.signatures[0]);
     try {
-      // a confirmation that times out is looked up on chain before it counts as a failure (it often landed)
-      await confirmOrCheck(connection, sig, tx.message.recentBlockhash, sw.lastValidBlockHeight || (await connection.getBlockHeight()) + 150);
+      // re-broadcast every ~2 s until it lands or expires; a wait that ends unsure is looked up on chain first.
+      // Jupiter's transaction carries its own priority fee and no Sender tip, so it goes through the RPC only.
+      await landTx(connection, tx.serialize(), sig, sw.lastValidBlockHeight || (await connection.getBlockHeight()) + 150,
+        { label: "jual Jupiter", fee: { level: pri, microLamports: null, feeLamports: Number(sw.prioritizationFeeLamports) || null } });
     } catch (e) {
+      if (e.sent === false) { const err = new Error(`send failed via ${labels.join("+")}: ${clip(e.message || e, 160)}`); err.labels = labels; throw err; }
       const err = new Error(`${e.onChain ? "failed on chain" : e.expired ? "expired before landing (block height exceeded)" : "not confirmed"} via ${labels.join("+")} (${sig})`);
       err.labels = labels; err.sent = true; err.expired = !!e.expired;
       throw err;
@@ -191,14 +195,13 @@ async function sellToSolInner(mint, rawAmount, opts) {
     if (dry && !verify) return { ...out, dryRun: true };
     const tx = await dlmm.swap({ inToken: new PublicKey(mint), outToken: new PublicKey(WSOL), inAmount: new BN(String(amount)),
       minOutAmount: q.minOutAmount, lbPair: dlmm.pubkey, user: owner, binArraysPubkey: q.binArraysPubkey });
-    tx.instructions.unshift(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
     tx.feePayer = owner;
     tx.recentBlockhash = (await connection.getLatestBlockhash("confirmed")).blockhash;
     const sim = await connection.simulateTransaction(tx);
     if (sim.value.err) throw new Error(`simulation failed: ${simErr(sim)}`);
     if (dry) return { ...out, dryRun: true, simulated: true };
     try {
-      return { ...out, signature: await sendLegacy(connection, tx, [signer], { simulate: false }) };
+      return { ...out, signature: await sendLegacy(connection, tx, [signer], { simulate: false, label: "jual DLMM" }) };
     } catch (e) {
       throw Object.assign(new Error(clip(e.message || e)), { sent: !e.simulation });
     }

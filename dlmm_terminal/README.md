@@ -85,6 +85,20 @@ python3 -m dlmm_terminal rpc            # 30 hari: total, Helius vs publik, per 
 python3 -m dlmm_terminal rpc --days 7
 ```
 
+`rpc` juga nampilin **Landing**: per jenis transaksi (buka slice, close, jual, flip), median dan p90 detik sampai masuk blok, rata-rata berapa kali dikirim, berapa yang expired, dan total fee + tip.
+
+## Transaksi cepat masuk (config `tx`)
+
+Nov 2026: separuh request Helius itu `getBlockHeight`, artinya tiap transaksi nunggu ±30–40 detik. Penyebabnya fee prioritas fix 50k microlamports dan nunggu konfirmasi secara pasif. Sekarang tiap transaksi buka/close/flip/cleanup:
+
+1. **Fee prioritas dinamis**: dari Helius `getPriorityFeeEstimate` (level `priorityLevel`, default High), minimal `minMicroLamports`, **maksimal `maxFeeSol` (0.001 SOL) per transaksi**. Kalau kirim ulang setelah expired, naik satu level.
+2. **Helius Sender** (`sender`): transaksi yang sama juga dikirim lewat `sender.helius-rpc.com` (staked connection), pakai tip kecil ke akun tip Helius. `swqos` = tip `senderTipSol` (default 0.00001 SOL, minimal 0.000005). `max` = semua jalur termasuk Jito, tip minimal 0.001 SOL. `off` = matiin. Kalau transaksinya kepenuhan buat tambahan tip, otomatis dikirim tanpa Sender. Penjualan lewat Jupiter tetap pakai fee dari Jupiter dan nggak lewat Sender.
+3. **Kirim ulang aktif**: transaksi yang sama (signature sama, jadi nggak mungkin dobel) dikirim ulang tiap `rebroadcastSec` sambil statusnya dicek ±tiap detik, sampai masuk atau blockhash-nya expired.
+4. **Paralel**: `parallelSlices` slice (default 3) dibuka atau ditutup barengan. Sebelum buka paralel, bin array yang dibutuhin ladder dibikin dulu sekali, biar dua slice nggak rebutan bikin bin array yang sama. Rent-nya sama kayak sebelumnya. `1` = satu-satu kayak dulu.
+5. **Waktu per transaksi** muncul di panel 📡 (`⏱ slice 2 masuk 3.4s · kirim 2x (+Sender) · fee ◎0.00012`) dan dicatat buat `rpc`.
+
+Biaya: fee + tip paling mahal ±0.00101 SOL per transaksi. Kebanyakan jauh di bawah itu, tergantung ramenya pool.
+
 ## Filter (gate = wajib, flag = warning)
 
 | Tipe | Rule | Kenapa (dari data) |

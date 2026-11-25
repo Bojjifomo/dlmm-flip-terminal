@@ -136,11 +136,37 @@ def jobs_view(limit: int = 12) -> list[dict]:
         return [{k: (v if k != "result" else None) for k, v in j.items()} | {"error": (j.get("result") or {}).get("error")} for j in rows]
 
 
+def tx_env(cfg: dict | None = None) -> dict:
+    """config.json "tx" (priority fee, Helius Sender, parallel slices) as the executor's DLMM_* env."""
+    if cfg is None:
+        try:
+            from .cli import load_config
+            cfg = load_config(None)
+        except Exception:
+            cfg = {}
+    t = cfg.get("tx") or {}
+    out = {}
+    def put(k, v, f=lambda x: x):
+        if v is not None:
+            try:
+                out[k] = str(f(v))
+            except (TypeError, ValueError):
+                pass
+    put("DLMM_FEE_LEVEL", t.get("priorityLevel"))
+    put("DLMM_FEE_MAX_LAMPORTS", t.get("maxFeeSol"), lambda x: int(round(float(x) * 1e9)))
+    put("DLMM_FEE_MIN_MICRO", t.get("minMicroLamports"), lambda x: int(x))
+    put("DLMM_SENDER", t.get("sender"), lambda x: "off" if x is False else "swqos" if x is True else str(x))
+    put("DLMM_SENDER_TIP_LAMPORTS", t.get("senderTipSol"), lambda x: int(round(float(x) * 1e9)))
+    put("DLMM_REBROADCAST_MS", t.get("rebroadcastSec"), lambda x: int(float(x) * 1000))
+    put("DLMM_PARALLEL_SLICES", t.get("parallelSlices"), lambda x: max(1, int(x)))
+    return out
+
+
 def run(script: str, args: list[str], timeout: int = 240) -> dict:
     missing = ready()
     if missing:
         return {"ok": False, "error": missing}
-    env = {**os.environ, "SOLANA_RPC_URL": rpc_url()}
+    env = {**os.environ, **tx_env(), "SOLANA_RPC_URL": rpc_url()}
     job = getattr(_tls, "job", None)
     proc = subprocess.Popen(["node", str(EXECUTOR / script), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, env=env, bufsize=1)

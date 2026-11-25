@@ -504,6 +504,33 @@ def cmd_rpc(a, cfg):
     print("  by method: " + ", ".join(f"{m} {n}" for m, n in sorted(methods.items(), key=lambda kv: -kv[1])))
     days = max(a.days, 1)
     print(f"  pace ≈ {total(rows, 'helius') / days * 30:,.0f} Helius requests / 30 days")
+    for line in tx_landing_lines(rows):
+        print(line)
+
+
+def tx_landing_lines(rows: list[dict]) -> list[str]:
+    """How long transactions took to land (executor rpc.tx rows): per kind, median / p90 seconds, broadcasts, fees."""
+    txs = [t for r in rows for t in (r.get("tx") or [])]
+    if not txs:
+        return ["  landing: belum ada data (dicatat mulai versi fee dinamis + Sender)"]
+    def kind(lbl: str) -> str:
+        lbl = (lbl or "").lower()
+        return ("buka slice" if lbl.startswith("slice") else "close" if lbl.startswith("close") else
+                "jual" if lbl.startswith("jual") else "flip" if lbl.startswith("flip") else lbl.split(" ")[0] or "tx")
+    out = [f"Landing, {len(txs)} transaksi:"]
+    groups: dict = {}
+    for t in txs:
+        groups.setdefault(kind(t.get("label")), []).append(t)
+    for k, g in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        ok = sorted(t["ms"] / 1000 for t in g if t.get("ok"))
+        med = ok[len(ok) // 2] if ok else None
+        p90 = ok[min(len(ok) - 1, int(len(ok) * 0.9))] if ok else None
+        fee = sum((t.get("feeLamports") or 0) + (t.get("tipLamports") or 0) for t in g) / 1e9
+        exp = sum(1 for t in g if t.get("expired"))
+        sends = sum(t.get("sends") or 0 for t in g) / len(g)
+        out.append(f"  {k:<12} {len(g):>4} tx · median {med if med is None else f'{med:.1f}s'} · p90 "
+                   f"{p90 if p90 is None else f'{p90:.1f}s'} · kirim {sends:.1f}x · expired {exp} · fee+tip ◎{fee:.5f}")
+    return out
 
 
 # ---------- benchmark wallet + entry signal ping ----------
