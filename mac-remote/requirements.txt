@@ -1,3 +1,0 @@
-pyobjc-framework-Quartz
-pyobjc-framework-ScreenCaptureKit
-pyobjc-framework-ApplicationServices
