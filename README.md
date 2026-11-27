@@ -6,7 +6,6 @@ errors in the old version.
 | Folder | Isi |
 | --- | --- |
 | `dlmm_terminal/` | **App-nya.** DLMM Web (Python) + executor (Node, Meteora SDK). Dari `Capstone1/dlmm_terminal`, udah dibenerin + fitur flip. Detail: [`dlmm_terminal/README.md`](dlmm_terminal/README.md) |
-| `mac-remote/` | **Mac Remote**: kontrol Mac mini / MacBook Pro dari iPhone (layar + keyboard + trackpad). Detail: [`mac-remote/README.md`](mac-remote/README.md) |
 | `flip-bot/` | Bot flip bid-ask versi CLI (TypeScript). Sumber mekanisme flip. Nggak perlu dijalanin kalau pakai DLMM Web |
 
 ## Jalanin di Mac

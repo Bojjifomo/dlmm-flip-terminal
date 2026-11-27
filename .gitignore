@@ -19,5 +19,3 @@ dlmm_terminal/executor/node_modules/
 *keypair*.json
 hot-wallet.json
 
-# mac-remote
-mac-remote/.venv/
