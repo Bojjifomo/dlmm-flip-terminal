@@ -69,7 +69,7 @@ class BenchmarkTests(unittest.TestCase):
     def test_signal_pings_only_on_new_matches(self):
         cfg = cli.load_config(None)
         prof = self._prof()
-        snap = {"address": "A", "name": "A-SOL", "tvl": 50_000, "created_at": (T0 - 5 * 3600) * 1000,
+        snap = {"address": "A", "name": "A-SOL", "tvl": 50_000, "created_at": (T0 - 10 * 3600) * 1000,
                 "token_x": {"address": "A", "symbol": "A", "market_cap": 1e6},
                 "token_y": {"address": SOL_MINT, "symbol": "SOL", "price": 100},
                 "pool_config": {"bin_step": 100}, "fees": {"1h": 200, "24h": 5000}, "volume": {"24h": 1e5},
@@ -82,7 +82,7 @@ class BenchmarkTests(unittest.TestCase):
              mock.patch.object(cli, "notify", sent.append), \
              mock.patch.object(cli.api, "open_portfolio", lambda w: []), \
              mock.patch.object(cli.api, "chunked", lambda *a, **k: []), \
-             mock.patch.object(cli.blast, "token_stats", lambda mints, now: {"A": {"volume24hUsd": 1e5, "ageHours": 5}}):
+             mock.patch.object(cli.blast, "token_stats", lambda mints, now: {"A": {"volume24hUsd": 1e5, "ageHours": 10}}):
             state = {}
             self.assertEqual(len(cli.signal_once(cfg, prof, state, now=T0)), 1)   # first scan: one digest
             self.assertIn("watcher on", sent[-1])

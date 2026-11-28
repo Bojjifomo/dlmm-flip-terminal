@@ -265,12 +265,13 @@ def _pick_notify(rows: list[dict], cfg: dict) -> None:
     PICK_STATE.write_text(json.dumps(st))
     if not fresh or first_run:        # the first scan only learns what is already in the list
         return
-    fresh.sort(key=lambda r: -(r.get("volMcap24h") or 0))
-    lines = [f"🎯 PICK baru ({len(fresh)}): lolos filter review lu"]
+    fresh.sort(key=lambda r: -(r.get("feePctDay", {}).get("1h") or r.get("feePctDay", {}).get("24h") or 0))
+    lines = [f"🎯 PICK baru ({len(fresh)}): lolos filter review lu (≥6j · 1h ≤+5% · bin ≤100)"]
     btns = []
     for r in fresh[:8]:
-        lines.append(f"• {r['symbol']} bin {r['binStep']} · 1h {r['priceChg1h']:+.0f}% · vol/mcap {r.get('volMcap24h') or 0:.2f}x"
-                     f" · fee {r['feePctDay']['24h']:.0f}%/d · TVL ${r['tvlUsd']:,.0f}")
+        f1h = (r.get("fees", {}).get("1h") or 0) / r["tvlUsd"] * 100 if r.get("tvlUsd") else 0
+        lines.append(f"• {r['symbol']} bin {r['binStep']} · 1h {r['priceChg1h']:+.0f}% · fee 1j {f1h:.2f}% ({r['feePctDay']['24h']:.0f}%/d)"
+                     f" · TVL ${r['tvlUsd']:,.0f}")
     for r in fresh[:3]:
         cb_n = tgbot.register_cb("narr", {"pool": r["pool"], "mint": r["tokenMint"], "symbol": r["symbol"],
                                           "mcapUsd": r.get("mcapUsd"), "priceChg1h": r.get("priceChg1h"),

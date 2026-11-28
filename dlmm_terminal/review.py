@@ -116,11 +116,15 @@ def _rules(cfg: dict) -> list[tuple[str, str, object]]:
     if g.get("maxPriceChg1hPct") is not None:
         m = g["maxPriceChg1hPct"]
         out.append(("pump1h", f"gate: harga 1h ≤ +{m:g}%", lambda e: None if e["priceChg1h"] is None else e["priceChg1h"] <= m))
-    if fl.get("youngPoolHours") is not None:
+    if g.get("minPoolAgeMinutes") and g["minPoolAgeMinutes"] >= 120:
+        h = g["minPoolAgeMinutes"] / 60
+        out.append(("poolAge", f"gate: pool ≥ {h:g} jam", lambda e: e["poolAgeHours"] >= h))
+    elif fl.get("youngPoolHours") is not None:
         h = fl["youngPoolHours"]
         out.append(("youngPool", f"flag: pool ≥ {h:g} jam", lambda e: e["poolAgeHours"] >= h))
-    if fl.get("volMcapBand"):
-        lo, hi = fl["volMcapBand"]
+    band = fl.get("volMcapBand")
+    if band and band[0] is not None and band[1] is not None:
+        lo, hi = band
         out.append(("volMcap", f"flag: vol 24h ÷ mcap {lo:g}–{hi:g}×", lambda e: None if e.get("volMcap24h") is None else lo <= e["volMcap24h"] <= hi))
     if fl.get("maxBinStep") is not None:
         b = fl["maxBinStep"]

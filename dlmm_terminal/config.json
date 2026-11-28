@@ -1,13 +1,14 @@
 {
   "_note": "Starting values from DLMM-Auto-Entry-Spec v1 (133 closed positions, Oct 25 - Nov 4 2026). Change only after re-testing on unseen tokens (spec section 7).",
   "universe": {"protocol": "meteora-dlmm", "quote": "SOL", "binStepMin": 20, "binStepMax": 250},
-  "gates": {"minPoolAgeMinutes": 60, "minFeeApr24hPct": 1000, "maxPositionPctOfTvl": null, "_maxPositionPctOfTvl": "off (owner, 2026-11-04); set a number like 3 to gate size vs TVL again", "maxPriceChg1hPct": 5, "_maxPriceChg1hPct": "owner Nov 2026 wallet review (67 entries): price 1h <= +5% at entry made +2.54% vs +0.37% above, with any one token left out too. null = off."},
+  "gates": {"minPoolAgeMinutes": 360, "_minPoolAgeMinutes": "promoted 60m -> 360m (6h) from Nov 6-28 2026 review (139 ladders): >=6h made +1.20% vs +0.58% below, 32/33 LOTO.", "minFeeApr24hPct": 1000, "maxPositionPctOfTvl": null, "_maxPositionPctOfTvl": "off (owner, 2026-11-04); set a number like 3 to gate size vs TVL again", "maxPriceChg1hPct": 5, "_maxPriceChg1hPct": "owner Nov 2026 wallet review (139 ladders): price 1h <= +5% at entry made +1.53% vs +0.41% above, 33/33 LOTO. null = off."},
   "position": {
     "strategy": "Spot", "side": "SOL-only", "rangeBottomPct": -70,
-    "bankrollSol": 160, "lossBudgetPct": 5, "defaultSizeSol": 8,
+    "bankrollSol": 160, "lossBudgetPct": 5, "defaultSizeSol": 5,
+    "_defaultSizeSol": "5 SOL (owner Nov 28 2026 review: 3-6 SOL made +2.04% / +8.27 SOL on 81 ladders vs >6 SOL +0.12% / +0.52 SOL on 51 ladders)",
     "ladderSlices": 5, "_ladder": "RH ladder: equal-width slices from the price down to rangeBottomPct, SOL split 1:2:...:n (deepest slice biggest), Spot inside each"
   },
-  "flags": {"pump1hPct": 25, "drop6hPct": -17, "minTvlUsd": 25000, "youngPoolHours": 6, "volMcapBand": [0.3, 3], "maxBinStep": 100, "_review2026_11": "owner Nov 2026 review: pools < 6h earned the most fee but lost the most to price (net +0.29%); 24h vol/mcap 0.3-3x made +2.5% vs +0.9% outside; bin step 200 broke even (4 entries). Flags, not gates.", "nightEntryLocalHours": [0, 9], "utcOffsetHours": 7},
+  "flags": {"pump1hPct": 25, "drop6hPct": -17, "minTvlUsd": 25000, "youngPoolHours": 6, "volMcapBand": [null, null], "maxBinStep": 100, "_review2026_11": "owner Nov 28 2026 review (139 ladders): pool >= 6h promoted to gate (32/33 LOTO); vol/mcap 0.3-3x turned off (failed LOTO 6/33: +1.06% in vs +1.13% out); bin step <= 100 kept as flag.", "nightEntryLocalHours": [0, 9], "utcOffsetHours": 7},
   "scan": {"pages": 2, "pageSize": 100, "prefilterMinTvlUsd": 1000},
   "signal": {
     "_note": "Entry ping: pool passes the v1 gates AND sits inside the benchmark wallet's habitat (bin steps it made SOL in + p10-p90 of pool age, mcap, fees 1h/24h at its entries). A similarity check on top of the gates, not a predictor (spec section 2).",
@@ -36,8 +37,8 @@
     "requireBenchmarkBinSteps": false,
     "_requireBenchmarkBinSteps": "true = also require a bin step the benchmark wallet made SOL in (the old layer 2). The benchmark wallet still drives the 👀 wallet-entry pings.",
     "bandOverrides": {
-      "_note": "Owner's layer-2 bands, GMGN-style (2026-11-05): age 60m-15000m, mcap $400K-$10M, volume >= $50K, total fees >= 50 SOL. null = no limit. tokenAgeHours / volume24hUsd are token-wide (DexScreener, all pairs); totalFeesSol is this DLMM pool's LP fees since launch (GMGN's 'Total Fees' counts trader fees on every venue, no free source).",
-      "tokenAgeHours": {"lo": 1, "hi": 250},
+      "_note": "Owner's layer-2 bands, GMGN-style (updated Nov 28 2026): age 6h-250h, mcap $400K-$10M, volume >= $50K, total fees >= 50 SOL. null = no limit. tokenAgeHours / volume24hUsd are token-wide (DexScreener, all pairs); totalFeesSol is this DLMM pool's LP fees since launch (GMGN's 'Total Fees' counts trader fees on every venue, no free source).",
+      "tokenAgeHours": {"lo": 6, "hi": 250},
       "mcapUsd": {"lo": 400000, "hi": 10000000},
       "volume24hUsd": {"lo": 50000, "hi": null},
       "totalFeesSol": {"lo": 50, "hi": null}
@@ -46,7 +47,7 @@
     "newAlertCooldownHours": 6
   },
   "autoReentry": {"_note": "Auto re-entry per ladder (Portfolio: re-entry off / on): a SOL-only ladder the price ran out of upwards, at least abovePct % over its top for confirmChecks checks, is closed and opened again at the current price (same slices and depth). Waits for the entry check (pump gate) when respectEntryCheck. Stays armed; cooldownMin between, maxPer24h per pool.", "abovePct": 5, "confirmChecks": 2, "respectEntryCheck": true, "cooldownMin": 30, "maxPer24h": 6},
-  "pick": {"_note": "🎯 PICK = the owner's review filter as its own list next to PING (PING unchanged): every gate passes (incl. no +5% hour), the 1h move is known, no young-pool / vol-mcap / bin-step flag. Sorted by 24h vol/mcap. Telegram once per pool per cooldownHours.", "telegram": true, "cooldownHours": 6},
+  "pick": {"_note": "🎯 PICK = the owner's proven review filter (Nov 28 2026, 139 ladders): every gate passes (incl. pool >= 6h & harga 1h <= +5%), the 1h move is known, bin step <= 100. vol/mcap removed after failing LOTO (6/33). Sorted by 1h fee % of TVL. Telegram once per pool per cooldownHours.", "telegram": true, "cooldownHours": 6},
   "flip": {
     "_note": "Bid-ask flip (from flip-bot/): a SOL-only slice the price fell through is reopened as a token-only BidAsk range above the price (same bins), and back to SOL below the price when the price runs up through it. Armed per pool in Portfolio (off / alert / auto). While armed, closeBelowRangeAfterMin and priceStopBelowEntryPct do not close that pool's positions.",
     "confirmMinutes": 4,

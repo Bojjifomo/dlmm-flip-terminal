@@ -150,10 +150,10 @@ def flags(f: dict, cfg: dict) -> list[str]:
         out.append(f"drop6h {f['priceChg6h']:.0f}%")
     if f["tvlUsd"] < fl["minTvlUsd"]:
         out.append(f"tvl ${f['tvlUsd']:,.0f}")
-    if fl.get("youngPoolHours") is not None and f["poolAgeHours"] < fl["youngPoolHours"]:
+    if fl.get("youngPoolHours") is not None and f["poolAgeHours"] < fl["youngPoolHours"] and f["poolAgeHours"] * 60 >= cfg["gates"]["minPoolAgeMinutes"]:
         out.append(f"young pool {f['poolAgeHours']:.1f}h")
     band = fl.get("volMcapBand")
-    if band and f.get("volMcap24h") is not None and not band[0] <= f["volMcap24h"] <= band[1]:
+    if band and band[0] is not None and band[1] is not None and f.get("volMcap24h") is not None and not band[0] <= f["volMcap24h"] <= band[1]:
         out.append(f"vol/mcap {f['volMcap24h']:.2f}x")
     if fl.get("maxBinStep") is not None and f["binStep"] is not None and f["binStep"] > fl["maxBinStep"]:
         out.append(f"bin step {f['binStep']}")
@@ -190,9 +190,10 @@ def evaluate(snapshot: dict, candles_1h: list[dict], cfg: dict, now: datetime | 
     }
 
 
-# 🎯 PICK: the owner's own entry filter from the Nov 2026 wallet review, as its own list next to PING.
-# Every gate passes (incl. no +5% hour), the 1h move is known, and none of the review's flags shows.
-PICK_FLAGS = ("young pool", "vol/mcap", "bin step")
+# 🎯 PICK: the owner's proven entry filter from the Nov 28 2026 wallet review (139 ladders).
+# Every gate passes (incl. pool >= 6h & harga 1h <= +5%), the 1h move is known, and bin step <= 100.
+# vol/mcap 0.3-3x was removed after failing LOTO (6/33: +1.06% inside vs +1.13% outside).
+PICK_FLAGS = ("young pool", "bin step")
 
 
 def pick(c: dict) -> bool:

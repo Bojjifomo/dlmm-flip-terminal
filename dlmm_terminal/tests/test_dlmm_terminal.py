@@ -211,11 +211,11 @@ class WebVerdictTests(unittest.TestCase):
 
 class PickTests(unittest.TestCase):
     def test_pick_needs_gates_known_1h_and_no_review_flags(self):
-        ok = {"gatesFailed": [], "priceChg1h": -2.0, "flags": ["tvl $9,000", "drop6h -20%"]}
-        self.assertTrue(filters.pick(ok))                                        # other flags are fine
+        ok = {"gatesFailed": [], "priceChg1h": -2.0, "flags": ["tvl $9,000", "drop6h -20%", "vol/mcap 5.00x"]}
+        self.assertTrue(filters.pick(ok))                                        # other flags (incl. vol/mcap) are fine
         self.assertFalse(filters.pick({**ok, "gatesFailed": ["pump1h: +9% > +5% (wait for a dip)"]}))
         self.assertFalse(filters.pick({**ok, "priceChg1h": None}))                # 1h move unknown
-        for f in ("young pool 3.0h", "vol/mcap 5.00x", "bin step 200"):
+        for f in ("young pool 3.0h", "bin step 200"):
             self.assertFalse(filters.pick({**ok, "flags": [f]}))
 
 

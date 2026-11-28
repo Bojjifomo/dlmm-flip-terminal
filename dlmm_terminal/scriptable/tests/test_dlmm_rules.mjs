@@ -54,7 +54,7 @@ check("makeConfig: overrides", () => {
   assert.equal(c.position.bankrollSol, 20);
   assert.equal(c.position.rangeBottomPct, -70);
   assert.equal(c.gates.maxPositionPctOfTvl, 3);
-  assert.equal(c.gates.minPoolAgeMinutes, 60);
+  assert.equal(c.gates.minPoolAgeMinutes, 360);
   assert.deepEqual(c.flags.nightEntryLocalHours, [0, 6]);
   assert.equal(c.signal.revival.mode, "flag");
   assert.ok(Math.abs(R.maxPositionSol(c) - 20 * 5 / 100 / 0.9) < 1e-12);
@@ -62,7 +62,7 @@ check("makeConfig: overrides", () => {
 check("plannedSizeSol caps at the loss budget", () => {
   const c = R.makeConfig({ BANKROLL_SOL: 160 });
   assert.equal(R.plannedSizeSol(c, 20), 8.8889);
-  assert.equal(R.plannedSizeSol(c, null), 8);
+  assert.equal(R.plannedSizeSol(c, null), 5);
 });
 
 // ---- the golden pools -----------------------------------------------------------------------------

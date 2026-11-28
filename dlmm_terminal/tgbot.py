@@ -135,16 +135,18 @@ def handle_command(text: str, cfg: dict, web_mod) -> tuple[str, dict | None]:
 
     if cmd == "/pick":
         data = web_mod.pool_rows(cfg, 2000, force=False)
-        picks = sorted([r for r in data.get("rows") or [] if r.get("pick")], key=lambda r: -(r.get("volMcap24h") or 0))
+        picks = sorted([r for r in data.get("rows") or [] if r.get("pick")],
+                       key=lambda r: -(r.get("feePctDay", {}).get("1h") or r.get("feePctDay", {}).get("24h") or 0))
         if not picks:
             return "🎯 PICK: belum ada pool yang lolos filter review sekarang.", None
         lines = [f"🎯 PICK sekarang ({len(picks)} pool):"]
         btns = []
         for r in picks[:6]:
             nt = f" [{r['narrativeTag']}]" if r.get("narrativeTag") else ""
+            f1h = (r.get("fees", {}).get("1h") or 0) / r["tvlUsd"] * 100 if r.get("tvlUsd") else 0
             lines.append(
-                f"• {r['symbol']}{nt} bin {r['binStep']} · 1h {r['priceChg1h']:+.0f}% · vol/mcap {r.get('volMcap24h') or 0:.2f}x"
-                f" · fee {r['feePctDay']['24h']:.0f}%/d · TVL ${r['tvlUsd']:,.0f}"
+                f"• {r['symbol']}{nt} bin {r['binStep']} · 1h {r['priceChg1h']:+.0f}% · fee 1j {f1h:.2f}% ({r['feePctDay']['24h']:.0f}%/d)"
+                f" · TVL ${r['tvlUsd']:,.0f}"
             )
             cb_n = register_cb("narr", {"pool": r["pool"], "mint": r["tokenMint"], "symbol": r["symbol"],
                                         "mcapUsd": r.get("mcapUsd"), "priceChg1h": r.get("priceChg1h"),

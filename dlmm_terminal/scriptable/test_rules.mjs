@@ -38,7 +38,7 @@ assert(R.cleanSetting("position.ladderSlices", "3").value === 3 && R.cleanSettin
 assert(R.cleanSetting("exits.stopLossPct", "").value === null && R.cleanSetting("nope.x", 1).error, "settings: empty = off, unknown refused");
 const c2 = R.applySettings(R.makeConfig({}), { "flags.nightEntryLocalHours.1": 7, "signal.blastTop": 5, "bogus.key": 1 });
 assert(c2.flags.nightEntryLocalHours[1] === 7 && c2.signal.blastTop === 5 && !c2.bogus, "settings: apply (list index, unknown ignored)");
-const mm = R.matchBenchmark({ binStep: 80, tokenAgeHours: 5, mcapUsd: 500000, volume24hUsd: 60000, totalFeesSol: 70 }, R.DEFAULT_PROFILE,
+const mm = R.matchBenchmark({ binStep: 80, tokenAgeHours: 10, mcapUsd: 500000, volume24hUsd: 60000, totalFeesSol: 70 }, R.DEFAULT_PROFILE,
   R.DEFAULTS.signal.bandOverrides, R.DEFAULTS.signal.matchDims, false);
 assert(mm.score === 1 && mm.dims === 4, "PING: GMGN bands only (no bin-step check)");
-assert(R.pingFilterText(R.makeConfig({}), 10, 12, 1) === "Filtered by: SOL pair, bin 20-250, pool age ≥ 60m, fee APR 24h ≥ 1,000%, token age 1h–250h, mcap $400.0k–$10.00M, vol 24h ≥ $50.0k, total fees ≥ 50 SOL. Excluded 1 dead→alive pool(s). Top 10 of 12, sorted by 1h Vol/TVL.", "PING: filter text = the Mac's");
+assert(R.pingFilterText(R.makeConfig({}), 10, 12, 1) === "Filtered by: SOL pair, bin 20-250, pool age ≥ 360m, fee APR 24h ≥ 1,000%, token age 6h–250h, mcap $400.0k–$10.00M, vol 24h ≥ $50.0k, total fees ≥ 50 SOL. Excluded 1 dead→alive pool(s). Top 10 of 12, sorted by 1h Vol/TVL.", "PING: filter text = the Mac's");

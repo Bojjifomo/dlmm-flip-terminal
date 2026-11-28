@@ -31,7 +31,7 @@ const DEFAULTS = {
     "binStepMax": 250
   },
   "gates": {
-    "minPoolAgeMinutes": 60,
+    "minPoolAgeMinutes": 360,
     "minFeeApr24hPct": 1000,
     "maxPositionPctOfTvl": null,
     "maxPriceChg1hPct": 5
@@ -42,7 +42,7 @@ const DEFAULTS = {
     "rangeBottomPct": -70,
     "bankrollSol": 160,
     "lossBudgetPct": 5,
-    "defaultSizeSol": 8,
+    "defaultSizeSol": 5,
     "ladderSlices": 5
   },
   "flags": {
@@ -51,8 +51,8 @@ const DEFAULTS = {
     "minTvlUsd": 25000,
     "youngPoolHours": 6,
     "volMcapBand": [
-      0.3,
-      3
+      null,
+      null
     ],
     "maxBinStep": 100,
     "nightEntryLocalHours": [
@@ -93,7 +93,7 @@ const DEFAULTS = {
     "requireBenchmarkBinSteps": false,
     "bandOverrides": {
       "tokenAgeHours": {
-        "lo": 1,
+        "lo": 6,
         "hi": 250
       },
       "mcapUsd": {
@@ -365,8 +365,8 @@ const SETTINGS_SCHEMA = [
   ["flags.drop6hPct", "Flag", "Drop 6h ≤ (%)", "num", {}],
   ["flags.minTvlUsd", "Flag", "TVL tipis < ($)", "num", { min: 0 }],
   ["flags.youngPoolHours", "Flag", "Pool muda < (jam) (kosong = off)", "numnull", { min: 0 }],
-  ["flags.volMcapBand.0", "Flag", "Vol 24h ÷ mcap min (x)", "num", { min: 0 }],
-  ["flags.volMcapBand.1", "Flag", "Vol 24h ÷ mcap maks (x)", "num", { min: 0 }],
+  ["flags.volMcapBand.0", "Flag", "Vol 24h ÷ mcap min (x) (kosong = off)", "numnull", { min: 0 }],
+  ["flags.volMcapBand.1", "Flag", "Vol 24h ÷ mcap maks (x) (kosong = off)", "numnull", { min: 0 }],
   ["flags.maxBinStep", "Flag", "Bin step di atas ini = flag (kosong = off)", "numnull", { min: 1 }],
   ["flags.nightEntryLocalHours.0", "Flag", "Jam malam dari (WIB)", "int", { min: 0, max: 23 }],
   ["flags.nightEntryLocalHours.1", "Flag", "Jam malam sampai (WIB)", "int", { min: 0, max: 24 }],
@@ -621,9 +621,9 @@ function flags(f, cfg) {
   if (f.priceChg1h != null && f.priceChg1h >= fl.pump1hPct && !gated) out.push(`pump1h +${pyFixed(f.priceChg1h, 0)}%`);
   if (f.priceChg6h != null && f.priceChg6h <= fl.drop6hPct) out.push(`drop6h ${pyFixed(f.priceChg6h, 0)}%`);
   if (f.tvlUsd < fl.minTvlUsd) out.push(`tvl $${commas(pyFixed(f.tvlUsd, 0))}`);
-  if (fl.youngPoolHours != null && f.poolAgeHours < fl.youngPoolHours) out.push(`young pool ${pyFixed(f.poolAgeHours, 1)}h`);
+  if (fl.youngPoolHours != null && f.poolAgeHours < fl.youngPoolHours && f.poolAgeHours * 60 >= cfg.gates.minPoolAgeMinutes) out.push(`young pool ${pyFixed(f.poolAgeHours, 1)}h`);
   const band = fl.volMcapBand;
-  if (band && f.volMcap24h != null && !(band[0] <= f.volMcap24h && f.volMcap24h <= band[1])) out.push(`vol/mcap ${pyFixed(f.volMcap24h, 2)}x`);
+  if (band && band[0] != null && band[1] != null && f.volMcap24h != null && !(band[0] <= f.volMcap24h && f.volMcap24h <= band[1])) out.push(`vol/mcap ${pyFixed(f.volMcap24h, 2)}x`);
   if (fl.maxBinStep != null && f.binStep != null && f.binStep > fl.maxBinStep) out.push(`bin step ${f.binStep}`);
   const [start, end] = fl.nightEntryLocalHours;
   if (f.entryHourLocal != null && start <= f.entryHourLocal && f.entryHourLocal < end) out.push(`night entry ${String(f.entryHourLocal).padStart(2, "0")}h`);

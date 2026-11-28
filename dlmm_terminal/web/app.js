@@ -240,9 +240,9 @@ function rowsView() {
       .filter(r => !q || `${r.symbol} ${r.name} ${r.pool} ${r.tokenMint}`.toLowerCase().includes(q));
   }
   if (m === "pick") {
-    // 🎯 PICK: the review filter, best 24h vol/mcap first (1-3x made the most in the review)
+    // 🎯 PICK: proven review filter (pool >= 6h, 1h <= +5%, bin <= 100), sorted by 1h fee rate
     return d.rows.filter(r => r.pick && (!q || `${r.symbol} ${r.name} ${r.pool} ${r.tokenMint}`.toLowerCase().includes(q)))
-      .sort((a, b) => (b.volMcap24h || 0) - (a.volMcap24h || 0));
+      .sort((a, b) => ((b.feePctDay && b.feePctDay["1h"]) || 0) - ((a.feePctDay && a.feePctDay["1h"]) || 0));
   }
   let rows = d.rows.filter(r => {
     if (m === "pass" && !["OPEN", "CAREFUL"].includes(r.verdict.level)) return false;
@@ -323,14 +323,13 @@ function renderPingInfo() {
   el.classList.toggle("hidden", state.mode !== "ping" && state.mode !== "pick");
   $("#nPing").textContent = p && p.rows ? p.rows.length : "";
   $("#nWatch").textContent = state.watch.length || "";
-  const picks = state.data ? state.data.rows.filter(r => r.pick).sort((a, b) => (b.volMcap24h || 0) - (a.volMcap24h || 0)) : [];
+  const picks = state.data ? state.data.rows.filter(r => r.pick).sort((a, b) => ((b.feePctDay && b.feePctDay["1h"]) || 0) - ((a.feePctDay && a.feePctDay["1h"]) || 0)) : [];
   $("#nPick").textContent = picks.length || "";
   if (state.mode === "pick") {
     const g = (state.cfg && state.cfg.cfg) || {}, gt = g.gates || {}, fl = g.flags || {};
-    const band = fl.volMcapBand || [0.3, 3];
+    const minAgeH = gt.minPoolAgeMinutes ? +(gt.minPoolAgeMinutes / 60).toFixed(1) : (fl.youngPoolHours ?? 6);
     const batchBtn = picks.length ? `<button class="btn" id="pickBatchNarr" title="Antre riset narasi Claude Code untuk top 3 pool PICK di background">🔎 Riset Top ${Math.min(3, picks.length)}</button>` : "";
-    el.innerHTML = `<span>🎯 <b>PICK</b> = filter review lu: semua gate lolos (harga 1h ≤ +${gt.maxPriceChg1hPct ?? 5}%),
-      pool ≥ ${fl.youngPoolHours ?? 6} jam, vol 24h ÷ mcap ${band[0]}–${band[1]}×, bin step ≤ ${fl.maxBinStep ?? 100}.</span>
+    el.innerHTML = `<span>🎯 <b>PICK</b> = filter review 139 ladder: semua gate lolos (pool ≥ ${minAgeH} jam, harga 1h ≤ +${gt.maxPriceChg1hPct ?? 5}%), bin step ≤ ${fl.maxBinStep ?? 100}. Urut: fee 1 jam.</span>
       <span class="spacer"></span>${batchBtn}`;
     const bb = $("#pickBatchNarr");
     if (bb) bb.onclick = async () => {
