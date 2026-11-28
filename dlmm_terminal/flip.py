@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 DEFAULTS = {"confirmMinutes": 4, "confirmChecks": 2, "maxFlipsPer24h": 8, "gapBins": 1, "slippagePct": 1,
-            "minSolReserve": 0.05, "wholeLadder": True}
+            "minSolReserve": 0.05, "wholeLadder": True, "staleAskHours": 12}
 MODES = ("off", "alert", "auto")
 
 
@@ -30,14 +30,25 @@ class FlipState:
     crossed_since: float | None = None
     checks: int = 0
     notified: bool = False
+    stale_since: float | None = None
+    last_fee_sol: float | None = None
+    stale_notified: bool = False
 
     def to_dict(self) -> dict:
-        return {"side": self.side, "crossed_since": self.crossed_since, "checks": self.checks, "notified": self.notified}
+        out = {"side": self.side, "crossed_since": self.crossed_since, "checks": self.checks, "notified": self.notified}
+        if self.stale_since is not None:
+            out["stale_since"] = self.stale_since
+        if self.last_fee_sol is not None:
+            out["last_fee_sol"] = self.last_fee_sol
+        if self.stale_notified:
+            out["stale_notified"] = True
+        return out
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "FlipState":
         d = d or {}
-        return cls(d.get("side"), d.get("crossed_since"), int(d.get("checks") or 0), bool(d.get("notified")))
+        return cls(d.get("side"), d.get("crossed_since"), int(d.get("checks") or 0), bool(d.get("notified")),
+                   d.get("stale_since"), d.get("last_fee_sol"), bool(d.get("stale_notified")))
 
 
 def side_of(price: float, range_min: float, range_max: float, sol_only: bool) -> str | None:
@@ -139,3 +150,32 @@ def load(path) -> dict:
 
 def flips_24h(d: dict, pool: str, now: float) -> int:
     return sum(1 for h in d.get("history") or [] if h.get("pool") == pool and h.get("ok") and now - (h.get("at") or 0) < 86400)
+
+
+def check_stale_ask(now: float, price: float, range_min: float, fee_sol: float | None,
+                    state: FlipState, cfg: dict | None = None) -> dict | None:
+    """Detect an ask position whose price dropped below range_min and earned no new fees
+    for >= staleAskHours (ported from flip-bot/). Returns None or {'hours', 'notify', 'msg'}."""
+    c = {**DEFAULTS, **(cfg or {})}
+    limit_h = c.get("staleAskHours")
+    if not limit_h or state.side != "ask":
+        state.stale_since, state.stale_notified = None, False
+        return None
+    fee_grew = fee_sol is not None and state.last_fee_sol is not None and fee_sol > state.last_fee_sol + 1e-6
+    if fee_sol is not None:
+        state.last_fee_sol = fee_sol
+    if price >= range_min or fee_grew:
+        state.stale_since, state.stale_notified = None, False
+        return None
+    if state.stale_since is None:
+        state.stale_since = now
+    hours = (now - state.stale_since) / 3600.0
+    if hours < float(limit_h):
+        return None
+    first = not state.stale_notified
+    state.stale_notified = True
+    return {
+        "hours": round(hours, 1),
+        "notify": first,
+        "msg": f"🧊 STALE ASK {hours:.1f}h tanpa fee (harga di bawah range ask): pertimbangkan Hold / Close+swap",
+    }

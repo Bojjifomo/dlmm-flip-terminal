@@ -51,11 +51,39 @@ SCHEMA = [
     ("exits.closeBelowRangeAfterMin", "Exit", "Close setelah N menit di bawah range (kosong = off)", "numnull", {"min": 0}),
     ("exits.takeProfitPct", "Exit", "Take profit (%) (kosong = off)", "numnull", {}),
     ("exits.stopLossPct", "Exit", "Stop loss (%, negatif) (kosong = off)", "numnull", {}),
+    ("flip.confirmMinutes", "Flip", "Konfirmasi tembus range (menit)", "num", {"min": 0, "max": 60}),
+    ("flip.confirmChecks", "Flip", "Konfirmasi cek berturut", "int", {"min": 1, "max": 20}),
+    ("flip.maxFlipsPer24h", "Flip", "Maks flip per pool / 24 jam", "int", {"min": 1, "max": 50}),
+    ("flip.gapBins", "Flip", "Gap bin dari harga aktif", "int", {"min": 1, "max": 20}),
+    ("flip.slippagePct", "Flip", "Slippage flip (%)", "num", {"min": 0.1, "max": 25}),
+    ("flip.minSolReserve", "Flip", "Sisa SOL minimum di wallet", "num", {"min": 0.01, "max": 5}),
+    ("flip.wholeLadder", "Flip", "Tunggu seluruh ladder ketembus dulu", "bool", {}),
+    ("flip.staleAskHours", "Flip", "Alert Stale Ask tanpa fee setelah (jam, kosong = off)", "numnull", {"min": 1, "max": 168}),
+    ("autoReentry.abovePct", "Re-entry", "Re-entry di atas batas atas range (%)", "num", {"min": 0.5, "max": 100}),
+    ("autoReentry.confirmChecks", "Re-entry", "Konfirmasi cek berturut", "int", {"min": 1, "max": 20}),
+    ("autoReentry.respectEntryCheck", "Re-entry", "Tunggu entry check lolos dulu", "bool", {}),
+    ("autoReentry.cooldownMin", "Re-entry", "Cooldown antar re-entry (menit)", "num", {"min": 1, "max": 1440}),
+    ("autoReentry.maxPer24h", "Re-entry", "Maks re-entry per pool / 24 jam", "int", {"min": 1, "max": 50}),
+    ("pick.telegram", "PICK", "Kirim Telegram saat ada 🎯 PICK baru", "bool", {}),
+    ("pick.cooldownHours", "PICK", "Cooldown notif PICK per pool (jam)", "num", {"min": 0.5, "max": 48}),
+    ("tx.priorityLevel", "Transaksi", "Priority fee Helius", "select", {"options": ["Medium", "High", "VeryHigh"]}),
+    ("tx.maxFeeSol", "Transaksi", "Batas fee prioritas per tx (SOL)", "num", {"min": 0.00005, "max": 0.05}),
+    ("tx.minMicroLamports", "Transaksi", "Fee prioritas min (microLamports)", "int", {"min": 1000, "max": 5000000}),
+    ("tx.sender", "Transaksi", "Helius Sender", "select", {"options": ["swqos", "max", "off"]}),
+    ("tx.senderTipSol", "Transaksi", "Tip Helius Sender (SOL)", "num", {"min": 0.000005, "max": 0.02}),
+    ("tx.rebroadcastSec", "Transaksi", "Kirim ulang aktif tiap (detik)", "num", {"min": 0.5, "max": 15}),
+    ("tx.parallelSlices", "Transaksi", "Slice paralel buka/tutup/flip", "int", {"min": 1, "max": 10}),
     ("web.refreshMin", "Web", "Refresh pool + portfolio tiap (menit)", "int", {"min": 1, "max": 120}),
-    ("web.autoExitCheckMin", "Web", "Cek auto exit (TP) tiap (menit, tanpa RPC)", "int", {"min": 1, "max": 60}),
+    ("web.autoExitCheckMin", "Web", "Cek auto exit / flip / re-entry tiap (menit, 0 RPC)", "int", {"min": 1, "max": 60}),
+    ("web.backgroundPickMin", "Web", "Scan 🎯 PICK di background tiap (menit, 0 = off)", "int", {"min": 0, "max": 120}),
+    ("web.tgBot", "Web", "Telegram 2-way bot (/pf, /pick, /pause, tombol)", "bool", {}),
 ]
 KEYS = {p: (kind, extra) for p, _, _, kind, extra in SCHEMA}
-DEFAULTS = {"trade": {"maxLossPct": 5}, "web": {"refreshMin": 15, "autoExitCheckMin": 2}}
+DEFAULTS = {
+    "trade": {"maxLossPct": 5},
+    "web": {"refreshMin": 15, "autoExitCheckMin": 2, "backgroundPickMin": 5, "tgBot": True},
+    "flip": {"staleAskHours": 12},
+}
 
 
 def _seg(k: str):

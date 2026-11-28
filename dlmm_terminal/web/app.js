@@ -268,11 +268,29 @@ function rowsView() {
 }
 
 // ---------- render: top bar ----------
+function paintPause() {
+  const b = $("#pauseBtn");
+  if (!b) return;
+  const paused = !!(state.paused || (state.pf && state.pf.paused) || (state.cfg && state.cfg.paused));
+  b.classList.toggle("paused", paused);
+  b.textContent = paused ? "⏸ PAUSED" : "▶ Auto";
+  b.title = paused ? "AUTO-TRADE PAUSED (auto-exit, flip, re-entry ditahan). Klik untuk resume." : "Auto-trade aktif. Klik untuk pause sementara (kill-switch).";
+}
 function renderTop() {
   const d = state.data;
   if (d) {
-    $("#stSol").innerHTML = `SOL <b>${fmtUsd(d.solUsd)}</b>`;
+    const rg = d.regime || {};
+    const s1 = rg.solChg1h != null ? ` <span class="${cls(rg.solChg1h)}">${fmtPct(rg.solChg1h, 1, true)}</span>` : "";
+    $("#stSol").innerHTML = `SOL <b>${fmtUsd(d.solUsd)}</b>${s1}`;
     $("#stCap").textContent = `max ${mS(d.maxPositionSol, 2)} / posisi`;
+    const rEl = $("#stRegime");
+    if (rEl && rg.regime && rg.regime !== "unknown") {
+      rEl.classList.remove("hidden", "riskoff", "caution");
+      if (rg.regime === "risk-off") { rEl.classList.add("riskoff"); rEl.textContent = `⚠ RISK-OFF (${rg.redPct}% merah)`; }
+      else if (rg.regime === "caution") { rEl.classList.add("caution"); rEl.textContent = `⚡ CAUTION (${rg.redPct}% merah)`; }
+      else { rEl.textContent = `● Normal (${rg.redPct}% merah)`; }
+      rEl.title = `Market breadth 1h: ${rg.redPct}% dari ${rg.sample} pool merah · median 1h ${fmtPct(rg.median1h, 1, true)} · SOL 1h ${fmtPct(rg.solChg1h, 1, true)} · 24h ${fmtPct(rg.solChg24h, 1, true)}`;
+    }
   }
   const pf = state.pf;
   if (pf && !pf.error) {
@@ -283,6 +301,7 @@ function renderTop() {
     $("#posCount").textContent = n;
     $("#posCount").classList.toggle("hidden", !n);
   }
+  paintPause();
   tickAge();
 }
 function tickAge() {
@@ -304,14 +323,25 @@ function renderPingInfo() {
   el.classList.toggle("hidden", state.mode !== "ping" && state.mode !== "pick");
   $("#nPing").textContent = p && p.rows ? p.rows.length : "";
   $("#nWatch").textContent = state.watch.length || "";
-  const nPick = state.data ? state.data.rows.filter(r => r.pick).length : 0;
-  $("#nPick").textContent = nPick || "";
+  const picks = state.data ? state.data.rows.filter(r => r.pick).sort((a, b) => (b.volMcap24h || 0) - (a.volMcap24h || 0)) : [];
+  $("#nPick").textContent = picks.length || "";
   if (state.mode === "pick") {
     const g = (state.cfg && state.cfg.cfg) || {}, gt = g.gates || {}, fl = g.flags || {};
     const band = fl.volMcapBand || [0.3, 3];
-    el.innerHTML = `<span>🎯 <b>PICK</b> = filter dari review wallet lu: semua gate lolos (fee APR, umur, harga 1h ≤ +${gt.maxPriceChg1hPct ?? 5}%),
-      pool ≥ ${fl.youngPoolHours ?? 6} jam, vol 24h ÷ mcap ${band[0]}–${band[1]}×, bin step ≤ ${fl.maxBinStep ?? 100}. Urut: vol ÷ mcap.
-      Flag lain (TVL tipis, drop 6h, jam malam) tetap ditampilin. Ubah angkanya di ⚙ Settings, cek hasilnya di 📊 Review.</span>`;
+    const batchBtn = picks.length ? `<button class="btn" id="pickBatchNarr" title="Antre riset narasi Claude Code untuk top 3 pool PICK di background">🔎 Riset Top ${Math.min(3, picks.length)}</button>` : "";
+    el.innerHTML = `<span>🎯 <b>PICK</b> = filter review lu: semua gate lolos (harga 1h ≤ +${gt.maxPriceChg1hPct ?? 5}%),
+      pool ≥ ${fl.youngPoolHours ?? 6} jam, vol 24h ÷ mcap ${band[0]}–${band[1]}×, bin step ≤ ${fl.maxBinStep ?? 100}.</span>
+      <span class="spacer"></span>${batchBtn}`;
+    const bb = $("#pickBatchNarr");
+    if (bb) bb.onclick = async () => {
+      const top3 = picks.slice(0, 3).map(r => ({ mint: r.tokenMint, symbol: r.symbol, pool: r.pool, mcapUsd: r.mcapUsd, priceChg1h: r.priceChg1h, priceChg24h: r.priceChg24h, vol24hUsd: r.vol24 }));
+      bb.disabled = true; bb.textContent = "jalan…";
+      try {
+        const res = await trade.call("/api/narrative/batch", { items: top3 });
+        if (res && res.jobId) { toast("🔎 Riset narasi batch dimulai — pantau di 📡 Aktivitas"); followJob(res.jobId, res.title).then(() => loadPools(true)).catch(() => {}); }
+      } catch (e) { alert("Gagal: " + (e.message || e)); }
+      finally { bb.disabled = false; bb.textContent = `🔎 Riset Top ${Math.min(3, picks.length)}`; }
+    };
     return;
   }
   if (state.mode !== "ping") return;
@@ -348,24 +378,27 @@ function renderPools() {
     const fee1hPct = r.tvlUsd ? r.fees["1h"] / r.tvlUsd * 100 : null;
     const icon = r.icon ? `<img src="${esc(r.icon)}" alt="" loading="lazy">` : `<span class="ph"></span>`;
     const rank = pg ? `<span class="rank ${fresh.has(r.pool) ? "new" : ""}" title="PING #${pg.rank} · 1h vol/TVL ${fmtPct(pg.volTvl1h, 1)}">📡#${pg.rank}</span>` : "";
+    const ntag = r.narrativeTag ? `<span class="ntag ${esc(r.narrativeTag)}" title="Hasil riset narasi terakhir">${esc(r.narrativeTag)}</span>` : "";
+    const mom = r.feeMomentum != null && r.feeMomentum >= 1.8 ? `<span class="mom pos" title="Fee 1h ${r.feeMomentum}x rata-rata 24h (lagi panas)">🔥${r.feeMomentum}x</span>`
+      : r.feeMomentum != null && r.feeMomentum <= 0.35 ? `<span class="mom muted" title="Fee 1h cuma ${r.feeMomentum}x rata-rata 24h (mulai sepi)">💤${r.feeMomentum}x</span>` : "";
     const sub2 = pg ? ` · vol/TVL 1h ${fmtPct(pg.volTvl1h, 0)}` : "";
     const star = `<button class="star ${watched(r.pool) ? "on" : ""}" data-star="${r.pool}" title="watchlist">${watched(r.pool) ? "★" : "☆"}</button>`;
     // phone: one card per pool, everything readable without scrolling sideways
     const sibBtn = sib ? `<span class="sibtag">↳ pool lain</span>` : `<button class="sib ${expanded.has(r.tokenMint) ? "on" : ""}" data-sib="${r.tokenMint}" title="semua pool DLMM token ini, termasuk yang kesaring">${expanded.has(r.tokenMint) ? "▴" : "▾"} semua pool</button>`;
     cards.push(`<div class="pcard ${r.pool === state.sel ? "sel" : ""} ${sib ? "sibrow" : ""}" data-pool="${r.pool}">
-      <div class="pc1">${star}${icon}<b class="psym">${esc(r.symbol)}</b>${rank}<span class="spacer"></span><span class="badge ${v.level}">${v.level}</span></div>
+      <div class="pc1">${star}${icon}<b class="psym">${esc(r.symbol)}</b>${rank}${ntag}<span class="spacer"></span><span class="badge ${v.level}">${v.level}</span></div>
       <div class="pc2"><span><small>TVL</small>${mU(r.tvlUsd)}</span><span><small>fee ${w}</small><b class="pos">${fmtPct(r.feePctDay[w], 1)}</b>/d</span>
-        <span><small>1 jam</small>${fmtPct(fee1hPct, 2)}</span><span><small>mcap</small>${mU(r.mcapUsd)}</span></div>
+        <span><small>1 jam</small>${fmtPct(fee1hPct, 2)}${mom}</span><span><small>mcap</small>${mU(r.mcapUsd)}</span></div>
       <div class="pc3">${r.binStep} · ${r.baseFeePct}% · ${age(r.poolAgeHours)} · <span class="${cls(r.priceChg24h)}">${fmtPct(r.priceChg24h, 0, true)} 24h</span>${sub2} ${sibBtn}</div>
       ${reasons ? `<div class="pc3 muted">${esc(reasons)}</div>` : ""}
       <div class="zap"><button data-zap="${size / 2}">⚡${mS(size / 2, 2)}</button><button data-zap="${size}">⚡${mS(size, 2)}</button><button class="edit" data-zap="ask">✏️</button></div>
     </div>`);
     html.push(`<tr data-pool="${r.pool}" class="${r.pool === state.sel ? "sel" : ""} ${sib ? "sibrow" : ""}">
-      <td><span class="sym"><button class="star ${watched(r.pool) ? "on" : ""}" data-star="${r.pool}" title="watchlist">${watched(r.pool) ? "★" : "☆"}</button>${icon}${esc(r.symbol)}${rank}</span>
+      <td><span class="sym"><button class="star ${watched(r.pool) ? "on" : ""}" data-star="${r.pool}" title="watchlist">${watched(r.pool) ? "★" : "☆"}</button>${icon}${esc(r.symbol)}${rank}${ntag}</span>
         <span class="sub">${r.binStep} · ${r.baseFeePct}% · ${age(r.poolAgeHours)} · <span class="${cls(r.priceChg24h)}">${fmtPct(r.priceChg24h, 0, true)} 24h</span>${sub2} · …${r.pool.slice(-6)} ${sibBtn}</span></td>
       <td class="r"><span class="big">${mU(r.tvlUsd)}</span><span class="sub">vol ${mU(r.vol24)}</span></td>
       <td class="r"><span class="big pos">${mU(r.fees[w])}</span><span class="sub">${fmtPct(r.feePctDay[w], 2)}/day</span></td>
-      <td class="r"><span class="big pos">${fmtPct(fee1hPct, 2)}</span><span class="sub">${mU(r.fees["1h"])} / jam</span></td>
+      <td class="r"><span class="big pos">${fmtPct(fee1hPct, 2)}${mom}</span><span class="sub">${mU(r.fees["1h"])} / jam</span></td>
       <td class="r"><span class="big">${mU(r.mcapUsd)}</span><span class="sub">${spark(r)} <span class="${cls(r.priceChg24h)}">${fmtPct(r.priceChg24h, 0, true)}</span></span></td>
       <td><span class="badge ${v.level}">● ${v.level} ${v.score > 0 ? "+" : ""}${v.score}</span><span class="reasons">${esc(reasons)}</span></td>
       <td><div class="zap">
@@ -389,6 +422,33 @@ function renderPools() {
 }
 
 // ---------- render: detail ----------
+const safetyCache = new Map();
+async function loadSafety(r) {
+  const el = $("#safetyCard");
+  if (!el || !r.tokenMint) return;
+  const hit = safetyCache.get(r.tokenMint);
+  const paint = s => {
+    if (state.sel !== r.pool) return;
+    if (!s || !s.ok) { el.className = "safety"; el.innerHTML = `<span class="muted">🛡 Safety (RugCheck): nggak kebaca (${esc((s && s.error) || "timeout")})</span>`; return; }
+    el.className = `safety ${s.level}`;
+    const badges = [];
+    if (s.rugged) badges.push(`<b class="neg">🚨 RUGGED</b>`);
+    if (s.transferTax) badges.push(`<b class="neg">⛔ Token-2022 Tax${s.transferFeePct != null ? ` ${s.transferFeePct}%` : ""}</b>`);
+    if (s.freezeAuth) badges.push(`<b class="neg">⛔ Freeze Auth</b>`);
+    if (s.mintAuth) badges.push(`<b class="warn">⚠ Mint Auth</b>`);
+    if (s.top10Pct != null) badges.push(`<span class="${s.top10Pct >= 35 ? "warn" : "muted"}">Top10: ${s.top10Pct}%</span>`);
+    if (s.scoreNorm != null) badges.push(`<span class="muted">skor ${s.scoreNorm}/100</span>`);
+    const issues = [...(s.dangers || []).map(x => `<div class="neg">• ${esc(x)}</div>`), ...(s.warns || []).slice(0, 3).map(x => `<div class="warn">• ${esc(x)}</div>`)].join("");
+    el.innerHTML = `<div><b>🛡 Safety: <span class="${s.level === "OK" ? "pos" : s.level === "WARN" ? "warn" : "neg"}">${s.level}</span></b> · ${badges.join(" · ") || '<span class="pos">bersih (no tax/mint/freeze)</span>'}</div>${issues}`;
+  };
+  if (hit && Date.now() - hit.at < 30 * 60000) return paint(hit.data);
+  try {
+    const s = await getJson(`/api/safety?mint=${encodeURIComponent(r.tokenMint)}`, null, 12000);
+    safetyCache.set(r.tokenMint, { at: Date.now(), data: s });
+    paint(s);
+  } catch (e) { paint({ ok: false, error: e.message }); }
+}
+
 function renderDetail(r, keepChart) {
   state.sel = r.pool;
   document.querySelectorAll("#pools tr, .pcard").forEach(tr => tr.classList.toggle("sel", tr.dataset.pool === r.pool));
@@ -400,6 +460,7 @@ function renderDetail(r, keepChart) {
     ...v.info.map(x => `<li class="info ${x.ok ? "" : "bad"}">${esc(x.text)}</li>`)].join("");
   const chart = `https://dexscreener.com/solana/${r.pool}?embed=1&theme=dark&trades=0&info=0`;
   const old = keepChart ? $("#detail .chart") : null;
+  const momTxt = r.feeMomentum != null ? ` · pace 1j ${r.feeMomentum}x` : "";
   $("#detail").innerHTML = `
     <div class="sheetbar"><button class="btn" data-closesheet>✕ Tutup</button><span class="spacer"></span><b>${esc(r.symbol)}</b></div>
     <div class="dh"><button class="star ${watched(r.pool) ? "on" : ""}" data-star="${r.pool}" title="watchlist">${watched(r.pool) ? "★" : "☆"}</button><span class="sym">${r.icon ? `<img src="${esc(r.icon)}" alt="">` : ""}<span class="name">${esc(r.symbol)}</span></span>
@@ -408,15 +469,26 @@ function renderDetail(r, keepChart) {
       <span class="spacer"></span>
       <a href="https://app.meteora.ag/dlmm/${r.pool}" target="_blank" rel="noopener">meteora ↗</a>
       <a href="https://dexscreener.com/solana/${r.pool}" target="_blank" rel="noopener">dex ↗</a></div>
+    <div class="extlinks">
+      <a href="https://gmgn.ai/sol/token/${r.tokenMint}" target="_blank" rel="noopener">GMGN ↗</a>
+      <a href="https://app.bubblemaps.io/sol/token/${r.tokenMint}" target="_blank" rel="noopener">Bubblemaps ↗</a>
+      <a href="https://rugcheck.xyz/tokens/${r.tokenMint}" target="_blank" rel="noopener">RugCheck ↗</a>
+      <a href="https://birdeye.so/token/${r.tokenMint}?chain=solana" target="_blank" rel="noopener">Birdeye ↗</a>
+      <span class="addr" title="copy token mint" data-copy="${r.tokenMint}">mint ${short(r.tokenMint)} ⧉</span>
+    </div>
     <div class="stats">
       <div><label class="muted">harga</label><b>${mU(r.priceUsd)}</b><span class="${cls(r.priceChg1h)}">${fmtPct(r.priceChg1h, 1, true)} 1j</span></div>
       <div><label class="muted">mcap</label><b>${mU(r.mcapUsd)}</b><span class="${cls(r.priceChg24h)}">${fmtPct(r.priceChg24h, 0, true)} 24j</span></div>
       <div><label class="muted">TVL</label><b>${mU(r.tvlUsd)}</b><span class="muted">umur ${age(r.poolAgeHours)}</span></div>
-      <div><label class="muted">fee / hari</label><b class="pos">${fmtPct(r.feePctDay["24h"], 2)}</b><span class="muted">APR ${Math.round(r.feeApr24h).toLocaleString()}%</span></div>
+      <div><label class="muted">fee / hari</label><b class="pos">${fmtPct(r.feePctDay["24h"], 2)}</b><span class="muted">APR ${Math.round(r.feeApr24h).toLocaleString()}%${momTxt}</span></div>
     </div>
     <div class="vbox ${v.level}"><span class="lv">${v.level}</span>${label} <span class="muted">skor ${v.score > 0 ? "+" : ""}${v.score}</span></div>
     <ul class="rs">${li}</ul>
+    <div class="safety" id="safetyCard"><span class="muted">🛡 Cek safety on-chain (RugCheck, 0 RPC)…</span></div>
     ${pingLine(r)}
+    <div class="qskip"><span class="muted">Quick skip:</span>
+      ${["rug/bundle", "narasi lemah", "vol fake", "chart jelek", "fee sepi"].map(t => `<button data-qskip="${esc(t)}">${esc(t)}</button>`).join("")}
+    </div>
     <div class="narr" id="narr"><button class="btn" data-narr="${r.pool}">🔎 Riset narasi</button> <span class="muted">Claude Code (langganan Claude lu) · X + web</span></div>
     <div class="allpools" id="allPools"><div class="muted">Semua pool ${esc(r.symbol)}…</div></div>
     <div class="zapbig">
@@ -429,6 +501,7 @@ function renderDetail(r, keepChart) {
     <div class="chart"><iframe src="${chart}" title="chart" loading="lazy"></iframe></div>`;
   if (old && old.querySelector("iframe").src === chart) $("#detail .chart").replaceWith(old);
   renderAllPools(r);
+  loadSafety(r);
   loadNarrative(r, false);
 }
 
@@ -462,6 +535,7 @@ async function loadNarrative(r, run, force) {
     const n = await trade.call("/api/narrative", { mint: r.tokenMint, symbol: r.symbol, pool: r.pool, force: !!force,
       mcapUsd: r.mcapUsd, priceChg1h: r.priceChg1h, priceChg24h: r.priceChg24h, vol24hUsd: r.vol24 });
     if (state.sel !== r.pool) return;
+    if (n.ok && n.tag) { r.narrativeTag = n.tag; renderPools(); }
     el.innerHTML = n.ok ? narrHtml(n) : `<div class="neg">✗ ${esc(n.error || "gagal")}</div><button class="btn" data-narr="${r.pool}">coba lagi</button>`;
   } catch (e) { el.innerHTML = `<div class="neg">✗ ${esc(e.message || e)}</div><button class="btn" data-narr="${r.pool}">coba lagi</button>`; }
 }
@@ -472,19 +546,23 @@ document.addEventListener("click", e => {
   if (r) loadNarrative(r, true, !!b.dataset.force);
 });
 
-// Detail: every DLMM SOL pool of this token (zap any of them) and its pools on other venues (context).
+// Detail: every DLMM SOL pool of this token (zap any of them), DLMM volume share %, and pools on other venues.
 async function renderAllPools(r) {
   let tp;
   try { tp = await loadTokenPools(r.tokenMint); } catch (e) { const el = $("#allPools"); if (el) el.innerHTML = `<div class="neg">Gagal ambil pool: ${esc(e.message)}</div>`; return; }
   const el = $("#allPools");
   if (!el || state.sel !== r.pool) return;
   const w = state.win, size = state.data.sizeSol;
+  const curRow = tp.rows.find(x => x.pool === r.pool);
+  const shareInfo = tp.dlmmTotalSharePct != null
+    ? `<div class="muted" style="margin-bottom:4px">📊 <b>DLMM Share</b>: ${curRow && curRow.dlmmVolSharePct != null ? `pool ini <b>${curRow.dlmmVolSharePct}%</b> · ` : ""}semua DLMM <b>${tp.dlmmTotalSharePct}%</b> dari total vol 24h token (${mU(tp.tokenVol24h)})${curRow && curRow.tokenVolMcap24h != null ? ` · token vol/mcap <b>${curRow.tokenVolMcap24h}x</b>` : ""}</div>`
+    : "";
   const list = tp.rows.map(x => `<div class="ap ${x.pool === r.pool ? "cur" : ""}" data-pick="${x.pool}">
-      <span><b>${x.binStep}</b> · ${x.baseFeePct}%</span><span>TVL ${mU(x.tvlUsd)}</span><span class="pos">${fmtPct(x.feePctDay[w], 1)}/d</span>
+      <span><b>${x.binStep}</b> · ${x.baseFeePct}%${x.dlmmVolSharePct != null ? ` <span class="muted">(${x.dlmmVolSharePct}%)</span>` : ""}</span><span>TVL ${mU(x.tvlUsd)}</span><span class="pos">${fmtPct(x.feePctDay[w], 1)}/d</span>
       <span class="badge ${x.verdict.level}">${x.verdict.level}</span>
       <span class="zap"><button data-zapp="${x.pool}" data-amt="${size / 2}">⚡½</button><button data-zapp="${x.pool}" data-amt="${size}">⚡</button></span></div>`).join("");
   const other = (tp.other || []).map(o => `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.dex)}${o.labels.length ? " " + esc(o.labels.join("/")) : ""} · ${esc(o.quote)} · liq ${mU(o.liqUsd)} · vol ${mU(o.vol24)} ↗</a>`).join("");
-  el.innerHTML = `<div class="aph">Semua pool DLMM ${esc(r.symbol)} / SOL <span class="muted">(${tp.rows.length}, termasuk yang kesaring di list)</span></div>${list || '<div class="muted">nggak ada</div>'}
+  el.innerHTML = `<div class="aph">Semua pool DLMM ${esc(r.symbol)} / SOL <span class="muted">(${tp.rows.length}, termasuk yang kesaring di list)</span></div>${shareInfo}${list || '<div class="muted">nggak ada</div>'}
     ${other ? `<div class="aph">DEX lain <span class="muted">(info, terminal LP di DLMM)</span></div><div class="apo">${other}</div>` : ""}`;
 }
 
@@ -541,6 +619,7 @@ function openZap(r, size) {
   $("#modalCard").classList.remove("wide");
   const d = state.data, maxSol = d.maxPositionSol, pos = (state.cfg && state.cfg.cfg && state.cfg.cfg.position) || {};
   const execMissing = state.cfg && state.cfg.executor;
+  const tpOpts = [0, 3, 5, 10].map(v => `<option value="${v}">${v ? `TP +${v}%` : "TP: off"}</option>`).join("");
   $("#modalCard").innerHTML = `
     <h3>⚡ Zap ${esc(r.symbol)} <span class="muted">bin ${r.binStep} · Spot SOL-only ladder</span></h3>
     <div class="acts">
@@ -552,6 +631,13 @@ function openZap(r, size) {
     </div>
     <div id="zBody" style="margin-top:10px"></div>
     <div id="zLadder" class="muted">Plan ladder…</div>
+    <div id="zIlBox" class="ilbox hidden"></div>
+    <div class="zpresets">
+      <span class="muted">Setelah buka:</span>
+      <label>Flip <select id="zArmFlip"><option value="">off</option><option value="alert">alert</option><option value="auto">auto</option></select></label>
+      <label><input type="checkbox" id="zArmReentry"> Auto re-entry</label>
+      <label><select id="zArmTp">${tpOpts}</select></label>
+    </div>
     <div class="acts">
       <button class="btn go" id="zOpen" ${trade.ready() ? "" : "disabled"} title="${esc(trade.why())}">${trade.ready() ? "⚡ Buka ladder" : "🔒 " + esc(trade.why())}</button>
       <a class="btn" href="https://app.meteora.ag/dlmm/${r.pool}" target="_blank" rel="noopener">Meteora ↗</a>
@@ -560,6 +646,10 @@ function openZap(r, size) {
     </div><div class="res" id="zMsg">${execMissing ? `⚠ Executor: ${esc(execMissing)}` : ""}</div>`;
   $("#modal").classList.remove("hidden");
   let cur = null, planTimer = null, planSeq = 0;
+  const fee1hPct = r.tvlUsd ? r.fees["1h"] / r.tvlUsd * 100 : null;
+  const openMints = (state.pf && state.pf.exposure && state.pf.exposure.openMints) || [];
+  const dupToken = r.tokenMint && openMints.includes(r.tokenMint);
+  const safHit = safetyCache.get(r.tokenMint);
   const draw = () => {
     const sz = parseFloat($("#zSize").value) || 0, bottom = parseFloat($("#zBottom").value) || 70, slices = parseInt($("#zSlices").value, 10) || 5;
     const strategy = $("#zStrat").value.toLowerCase();
@@ -571,6 +661,10 @@ function openZap(r, size) {
     const warn = [];
     if (sz > maxSol + 1e-9) warn.push(`⛔ ${fmtSol(sz, 2)} di atas cap loss budget ${fmtSol(maxSol, 2)}`);
     if (bottom < 65) warn.push(`⚠ Range bottom −${bottom}%: spec pakai −70% (semua rugi besar jatuh 44–58%)`);
+    if (dupToken) warn.push(`⚠ DUPLICATE TOKEN: lu udah punya posisi aktif di ${r.symbol} — hati-hati eksposur dobel!`);
+    if (safHit && safHit.data && safHit.data.ok && safHit.data.level === "DANGER") {
+      warn.push(`🚨 SAFETY DANGER: ${[safHit.data.transferTax ? "Token-2022 Tax" : "", safHit.data.freezeAuth ? "Freeze Auth" : "", safHit.data.rugged ? "RUGGED" : "", ...(safHit.data.dangers || [])].filter(Boolean).slice(0, 3).join(" · ")}`);
+    }
     const flags = r.verdict.reasons.filter(x => x.flag).map(x => "⚠ " + nice(x.text));
     $("#zBody").innerHTML = `
       <div class="vbox ${gateFails.length ? "WAIT" : flags.length ? "CAREFUL" : "OPEN"}" style="margin:0 0 10px">
@@ -584,8 +678,18 @@ function openZap(r, size) {
   async function loadPlan() {
     const seq = ++planSeq;
     $("#zLadder").innerHTML = '<span class="muted">Plan ladder…</span>';
-    const p = await post("/api/ladder/plan", { pool: r.pool, sol: cur.sz, slices: cur.slices, bottom: cur.bottom, strategy: cur.strategy }).catch(e => ({ ok: false, error: e.message }));
+    const [p, il] = await Promise.all([
+      post("/api/ladder/plan", { pool: r.pool, sol: cur.sz, slices: cur.slices, bottom: cur.bottom, strategy: cur.strategy }).catch(e => ({ ok: false, error: e.message })),
+      getJson(`/api/il_breakeven?size=${cur.sz}&bottom=${cur.bottom}&slices=${cur.slices}${fee1hPct != null ? `&fee1h=${fee1hPct.toFixed(4)}` : ""}`).catch(() => null),
+    ]);
     if (seq !== planSeq) return;
+    if (il && il.scenarios) {
+      const box = $("#zIlBox");
+      box.classList.remove("hidden");
+      box.innerHTML = `<div class="muted"><b>Estimasi IL & Waktu Balik Modal</b> (pace fee 1h sekarang: ${il.fee1hPct != null ? `${il.fee1hPct.toFixed(2)}%/jam` : "n/a"})</div>
+        <table><tr><th>Jika harga turun</th><th>Estimasi IL</th><th>Rugi SOL</th><th>Balik modal (fee 1h)</th></tr>
+        ${il.scenarios.map(s => `<tr><td>${s.dropPct}%</td><td class="neg">${s.lossPct.toFixed(1)}%</td><td class="neg">◎${s.lossSol.toFixed(3)}</td><td>${s.recoverHours != null ? `~${s.recoverHours} jam` : "--"}</td></tr>`).join("")}</table>`;
+    }
     if (!p.ok) { $("#zLadder").innerHTML = `<span class="neg">${esc(p.error || "plan gagal")}</span>`; return; }
     const pl = p.plan, mx = Math.max(...pl.slices.map(s => s.sol));
     cur.plan = pl;
@@ -609,12 +713,16 @@ function openZap(r, size) {
     if (!trade.ready() || !cur.plan) return;
     const over = [...cur.gateFails, ...(cur.over ? ["di atas cap loss budget"] : [])];
     if (over.length && !confirm(`Spec v1 bilang jangan:\n${over.join("\n")}\n\nTetap buka? (dicatat sebagai override)`)) return;
-    if (!confirm(`Buka ladder ${r.symbol}?\n${cur.sz} SOL · ${cur.plan.slices.length} slice ${cur.strategy} · harga → −${cur.plan.realEnd.toFixed(1)}%\nWallet ${short(trade.info.wallet)}. Ini kirim transaksi beneran.`)) return;
+    const armFlip = $("#zArmFlip").value || null;
+    const armReentry = $("#zArmReentry").checked;
+    const armTp = +$("#zArmTp").value || null;
+    const presetTxt = [armFlip ? `Flip: ${armFlip}` : "", armReentry ? "Auto re-entry" : "", armTp ? `TP +${armTp}%` : ""].filter(Boolean).join(" · ");
+    if (!confirm(`Buka ladder ${r.symbol}?\n${cur.sz} SOL · ${cur.plan.slices.length} slice ${cur.strategy} · harga → −${cur.plan.realEnd.toFixed(1)}%${presetTxt ? `\nAuto preset: ${presetTxt}` : ""}\nWallet ${short(trade.info.wallet)}. Ini kirim transaksi beneran.`)) return;
     const btn = $("#zOpen");
     btn.disabled = true;
     try {
       $("#zMsg").textContent = "Simulasi + kirim slice satu-satu (bisa 1–2 menit)…";
-      const s = await trade.call("/api/trade/open", { pool: r.pool, symbol: r.symbol, sol: cur.sz, slices: cur.slices, bottom: cur.bottom, strategy: cur.strategy, override: over.length > 0 });
+      const s = await trade.call("/api/trade/open", { pool: r.pool, symbol: r.symbol, sol: cur.sz, slices: cur.slices, bottom: cur.bottom, strategy: cur.strategy, override: over.length > 0, armFlip, armReentry, armTp });
       showOpenResult(s, r);
       setTimeout(loadPortfolio, 4000);
     } catch (e) {
@@ -947,6 +1055,15 @@ function renderPortfolio() {
     <span>deposit <b>${mS(pf.depositSol, 3)}</b></span>
     <span>wallet bebas <b>${mS(pf.walletSol, 3)}</b></span>
     <span class="muted">dicek ${new Date(pf.t * 1000).toLocaleTimeString()}</span>`;
+  const exp = pf.exposure;
+  const expEl = $("#pfExposure");
+  if (expEl && exp) {
+    const depCls = exp.deployedPct != null && exp.deployedPct >= 75 ? "neg" : exp.deployedPct != null && exp.deployedPct >= 50 ? "warn" : "pos";
+    expEl.innerHTML = `${pf.paused ? `<span class="neg"><b>⏸ AUTO-TRADE PAUSED</b></span>` : ""}
+      <span>🛡 Deployed <b class="${depCls}">${mS(exp.deployedSol, 2)}</b>${exp.deployedPct != null ? ` (<b class="${depCls}">${exp.deployedPct}%</b> dari bankroll ◎${exp.bankrollSol})` : ""} · ${exp.pools} pool</span>
+      <span>SOL-only bid: <b class="pos">${mS(exp.solOnlySol, 2)}</b> (${exp.solOnlyPools})</span>
+      <span>Pegang token (in-range/ask/out): <b class="${exp.tokenExposedSol > 0 ? "warn" : "muted"}">${mS(exp.tokenExposedSol, 2)}</b> (${exp.tokenExposedPools})</span>`;
+  }
   $("#pfEmpty").classList.toggle("hidden", pf.rows.length > 0);
   if (!pf.rows.length) $("#pfEmpty").textContent = "Nggak ada posisi DLMM SOL yang terbuka di wallet ini.";
   // One row per pool: a ladder of N slices is one position to look at, close and re-enter.
@@ -964,10 +1081,12 @@ function renderPortfolio() {
     const alerts = [...new Set(ev.filter(e => e.kind === "alert").map(e => e.msg))];
     const inRange = rows.some(r => r.inRange), allAbove = rows.every(r => r.price > r.rangeMax), below = rows.every(r => r.below);
     const holdsToken = rows.some(r => !r.solOnly) || inRange || below;
-    const status = exit ? `<span class="badge WAIT">EXIT</span> <span class="neg">${esc(exit.msg)}</span>`
+    const staleHit = rows.map(r => r.staleAsk).find(Boolean);
+    const staleTag = staleHit ? `<div class="stalebadge" title="${esc(staleHit.msg)}">🧊 STALE ASK ${staleHit.hours}h (0 fee)</div>` : "";
+    const status = (exit ? `<span class="badge WAIT">EXIT</span> <span class="neg">${esc(exit.msg)}</span>`
       : alerts.length ? `<span class="badge CAREFUL">ALERT</span> <span class="warn">${esc(alerts.join(" · "))}</span>`
       : below ? `<span class="badge CAREFUL">OUT</span> <span class="muted">di bawah range</span>`
-      : `<span class="badge OPEN">OK</span> <span class="muted">${inRange ? "in range, earning" : "di atas range (masih SOL)"}</span>`;
+      : `<span class="badge OPEN">OK</span> <span class="muted">${inRange ? "in range, earning" : "di atas range (masih SOL)"}</span>`) + staleTag;
     const dep = p.poolDepositSol || 0, pnlSol = p.poolPnlSol != null ? p.poolPnlSol : rows.reduce((a, r) => a + (r.pnlSol || 0), 0);
     const pnlPct = dep ? pnlSol / dep * 100 : p.pnlPct;
     const peak = Math.max(...rows.map(r => r.peakPnlPct || 0));
@@ -1171,11 +1290,21 @@ $("#detail").addEventListener("click", async e => {
   const z = e.target.closest("[data-zap]");
   const r = state.data && rowOf(state.sel);
   if (z && r) return openZap(r, z.dataset.zap === "ask" ? state.data.sizeSol : parseFloat(z.dataset.zap));
+  const qs = e.target.closest("[data-qskip]");
+  if (qs && r) {
+    const reason = qs.dataset.qskip;
+    try {
+      await post("/api/decide", { pool: r.pool, symbol: r.symbol, decision: "skip", decisionReason: reason,
+        level: r.verdict.level, gatesFailed: r.gatesFailed, flags: r.flags });
+      toast(`✓ Skip ${r.symbol} dicatat (${reason})`);
+    } catch (err) { toast("Gagal log skip: " + err.message); }
+    return;
+  }
   const c = e.target.closest("[data-copy]");
   if (c) { try { await navigator.clipboard.writeText(c.dataset.copy); c.textContent = "copied ✓"; } catch (err) {} }
 });
 
-// ---------- 📊 Review: your own ladders of the last N days (Meteora API, 0 RPC) ----------
+// ---------- 📊 Review: your own ladders of the last N days (Meteora API, 0 RPC + local logs) ----------
 const CLASS_TXT = { good: "fee gede + harga nahan", priceAte: "fee kemakan harga", thin: "fee tipis" };
 const rvPc = v => (v == null ? "--" : `${v > 0 ? "+" : ""}${v.toFixed(2)}%`);
 const rvSl = v => (v == null ? "--" : `${v > 0 ? "+" : ""}${v.toFixed(3)}`);
@@ -1183,19 +1312,62 @@ const rvCls = v => (v == null ? "" : v > 0 ? "pos" : v < 0 ? "neg" : "");
 function reviewHtml(r) {
   if (!r) return `<p class="muted">Belum ada review. Tekan <b>Hitung</b> (±1-5 menit, nggak pakai RPC).</p>`;
   const t = r.total;
+  const np = r.netPnl || {};
+  const netLine = np.netPnlSol != null
+    ? `<br>True Net PnL (est): <b class="${rvCls(np.netPnlSol)}">◎${rvSl(np.netPnlSol)}</b> <span class="muted">(gross ◎${rvSl(np.grossPnlSol)} − tx fee+tip ◎${(np.txFeeSol || 0).toFixed(4)} [${np.txCount || 0} tx] − swap slippage ◎${(np.swapSlippageSol || 0).toFixed(4)} [${np.swapCount || 0} jual, ${np.swapFailCount || 0} gagal])</span>`
+    : "";
   const rules = r.rules.map(x => `<tr><td>${esc(x.text)}</td>
       <td>${x.kept.n} · <span class="${rvCls(x.kept.pnlPct)}">${rvPc(x.kept.pnlPct)}</span></td>
       <td>${x.out.n} · <span class="${rvCls(x.out.pnlPct)}">${rvPc(x.out.pnlPct)}</span></td>
       <td>${x.holdsLoto}/${x.coins}</td><td>${x.verdict === "kebukti" ? "✅ kebukti" : x.verdict === "data kurang" ? "… data kurang" : "❔ belum"}</td></tr>`).join("");
   const coins = r.coins.map(c => `<tr><td><b>${esc(c.symbol)}</b> <span class="tag ${c.class}">${CLASS_TXT[c.class]}</span></td>
       <td>${c.n}</td><td>${c.capitalSol.toFixed(1)}</td><td class="${rvCls(c.pnlSol)}">${rvSl(c.pnlSol)} (${rvPc(c.pnlPct)})</td>
-      <td class="pos">${rvPc(c.feePct)}</td><td class="${rvCls(c.pricePct)}">${rvPc(c.pricePct)}</td><td>${c.avgChg1h > 0 ? "+" : ""}${c.avgChg1h}%</td></tr>`).join("");
+      <td class="pos">${rvPc(c.feePct)}</td><td class="${rvCls(c.pricePct)}">${rvPc(c.pricePct)}</td><td>${c.avgChg1h == null ? "--" : `${c.avgChg1h > 0 ? "+" : ""}${c.avgChg1h}%`}</td></tr>`).join("");
   const hold = Object.entries(r.hold).map(([k, h]) => `<tr><td>${k}</td><td>${h.n}</td><td class="${rvCls(h.pnlPct)}">${rvPc(h.pnlPct)}</td><td>${h.bigLosses}</td></tr>`).join("");
+
+  // Campaigns (Flip vs Standard)
+  const cp = r.campaigns;
+  const campHtml = cp && (cp.flipsTotal > 0 || cp.reentriesTotal > 0) ? `
+    <h4>CAMPAIGN: FLIP vs STANDAR <span class="muted">(${cp.flipsTotal} flip · ${cp.reentriesTotal} auto-reentry)</span></h4>
+    <table><tr><th>Tipe</th><th>n leg</th><th>◎ modal</th><th>PnL SOL</th><th>PnL %</th><th>Win</th></tr>
+      <tr><td>Pool di-flip</td><td>${cp.flipped.n}</td><td>${cp.flipped.capitalSol.toFixed(1)}</td><td class="${rvCls(cp.flipped.pnlSol)}">${rvSl(cp.flipped.pnlSol)}</td><td class="${rvCls(cp.flipped.pnlPct)}">${rvPc(cp.flipped.pnlPct)}</td><td>${cp.flipped.wins}/${cp.flipped.n}</td></tr>
+      <tr><td>Ladder standar</td><td>${cp.standard.n}</td><td>${cp.standard.capitalSol.toFixed(1)}</td><td class="${rvCls(cp.standard.pnlSol)}">${rvSl(cp.standard.pnlSol)}</td><td class="${rvCls(cp.standard.pnlPct)}">${rvPc(cp.standard.pnlPct)}</td><td>${cp.standard.wins}/${cp.standard.n}</td></tr>
+    </table>` : "";
+
+  // Counterfactual & Override Audit
+  const cf = r.counterfactual;
+  const cfHtml = cf && (cf.skippedFollowed > 0 || (cf.followedRules && cf.followedRules.n > 0) || (cf.overridden && cf.overridden.n > 0)) ? `
+    <h4>AUDIT DISIPLIN & COUNTERFACTUAL</h4>
+    <table><tr><th>Kelompok</th><th>n</th><th>PnL SOL</th><th>PnL %</th><th>Info</th></tr>
+      ${cf.followedRules && cf.followedRules.n ? `<tr><td>Ikut rules (no override)</td><td>${cf.followedRules.n}</td><td class="${rvCls(cf.followedRules.pnlSol)}">${rvSl(cf.followedRules.pnlSol)}</td><td class="${rvCls(cf.followedRules.pnlPct)}">${rvPc(cf.followedRules.pnlPct)}</td><td>${cf.followedRules.wins}/${cf.followedRules.n} win</td></tr>` : ""}
+      ${cf.overridden && cf.overridden.n ? `<tr><td>Override gate/cap</td><td>${cf.overridden.n}</td><td class="${rvCls(cf.overridden.pnlSol)}">${rvSl(cf.overridden.pnlSol)}</td><td class="${rvCls(cf.overridden.pnlPct)}">${rvPc(cf.overridden.pnlPct)}</td><td>${cf.overridden.wins}/${cf.overridden.n} win</td></tr>` : ""}
+      ${cf.skippedFollowed ? `<tr><td>Kandidat di-skip (followup 24h)</td><td>${cf.skippedFollowed}</td><td>--</td><td>--</td><td>selamat dr dump ≥40%: <b>${cf.savedDump40}</b> (≥60%: ${cf.savedDump60}) · terlewat aman: ${cf.missedSafe}</td></tr>` : ""}
+    </table>` : "";
+
+  // Narrative Tag ROI
+  const narrs = r.narratives || [];
+  const narrHtmlSec = narrs.length ? `
+    <h4>ROI TAG NARASI (narratives.jsonl)</h4>
+    <table><tr><th>Tag</th><th>n</th><th>◎ modal</th><th>PnL SOL</th><th>PnL %</th><th>Win</th></tr>
+      ${narrs.map(x => `<tr><td><span class="ntag ${esc(x.tag)}">${esc(x.tag)}</span></td><td>${x.n}</td><td>${x.capitalSol.toFixed(1)}</td><td class="${rvCls(x.pnlSol)}">${rvSl(x.pnlSol)}</td><td class="${rvCls(x.pnlPct)}">${rvPc(x.pnlPct)}</td><td>${x.wins}/${x.n}</td></tr>`).join("")}
+    </table>` : "";
+
+  // Breakdowns (Session, Bin Step, Size)
+  const bd = r.breakdowns;
+  const bdHtml = bd ? `
+    <h4>BREAKDOWN: SESI (WIB) · BIN STEP · UKURAN</h4>
+    <div class="scroll"><table><tr><th>Kelompok</th><th>n</th><th>◎ modal</th><th>PnL SOL</th><th>PnL %</th><th>Win</th></tr>
+      ${Object.entries(bd.bySession || {}).map(([k, h]) => `<tr><td>Sesi: ${esc(k)}</td><td>${h.n}</td><td>${h.capitalSol.toFixed(1)}</td><td class="${rvCls(h.pnlSol)}">${rvSl(h.pnlSol)}</td><td class="${rvCls(h.pnlPct)}">${rvPc(h.pnlPct)}</td><td>${h.wins}/${h.n}</td></tr>`).join("")}
+      ${(bd.byBinStep || []).map(h => `<tr><td>Bin step ${h.binStep}</td><td>${h.n}</td><td>${h.capitalSol.toFixed(1)}</td><td class="${rvCls(h.pnlSol)}">${rvSl(h.pnlSol)}</td><td class="${rvCls(h.pnlPct)}">${rvPc(h.pnlPct)}</td><td>${h.wins}/${h.n}</td></tr>`).join("")}
+      ${Object.entries(bd.bySize || {}).map(([k, h]) => `<tr><td>Size ${esc(k)}</td><td>${h.n}</td><td>${h.capitalSol.toFixed(1)}</td><td class="${rvCls(h.pnlSol)}">${rvSl(h.pnlSol)}</td><td class="${rvCls(h.pnlPct)}">${rvPc(h.pnlPct)}</td><td>${h.wins}/${h.n}</td></tr>`).join("")}
+    </table></div>` : "";
+
   return `<p>${esc((r.from || "").slice(0, 10))} → ${esc((r.to || "").slice(0, 10))} · ${t.n} ladder · modal ◎${t.capitalSol.toFixed(1)}<br>
-      PnL <b class="${rvCls(t.pnlSol)}">◎${rvSl(t.pnlSol)}</b> (${rvPc(t.pnlPct)}) = fee <b class="pos">◎${rvSl(t.feesSol)}</b> + harga <b class="${rvCls(t.priceSol)}">◎${rvSl(t.priceSol)}</b> · ${t.wins}/${t.n} untung
+      PnL <b class="${rvCls(t.pnlSol)}">◎${rvSl(t.pnlSol)}</b> (${rvPc(t.pnlPct)}) = fee <b class="pos">◎${rvSl(t.feesSol)}</b> + harga <b class="${rvCls(t.priceSol)}">◎${rvSl(t.priceSol)}</b> · ${t.wins}/${t.n} untung${netLine}
       <span class="muted">· dihitung ${r.t ? new Date(r.t * 1000).toLocaleString() : "?"}</span></p>
     <h4>FILTER: KALAU DIPAKAI</h4>
     <div class="scroll"><table><tr><th>Aturan (setting sekarang)</th><th>Lolos: n · PnL</th><th>Ditolak: n · PnL</th><th>Tahan tanpa 1 koin</th><th></th></tr>${rules}</table></div>
+    ${campHtml}${cfHtml}${narrHtmlSec}${bdHtml}
     <h4>PER KOIN</h4>
     <div class="scroll"><table><tr><th>Koin</th><th>n</th><th>◎ modal</th><th>PnL</th><th>Fee</th><th>Harga</th><th>Rata2 1h saat masuk</th></tr>${coins}</table></div>
     <h4>LAMA DIPEGANG</h4>
@@ -1208,7 +1380,7 @@ async function openReview() {
   $("#modalCard").classList.add("wide");
   $("#modal").classList.remove("hidden");
   const paint = st => {
-    $("#modalCard").innerHTML = `<h3>📊 Review <span class="muted">ladder lu sendiri · Meteora API, 0 RPC</span></h3>
+    $("#modalCard").innerHTML = `<h3>📊 Review <span class="muted">ladder lu sendiri · Meteora API, 0 RPC + log lokal</span></h3>
       <div class="rv">${st.running ? `<p>⏳ lagi ngitung… ${esc(st.progress || "")}</p>` : ""}${st.error ? `<p class="neg">✗ ${esc(st.error)}</p>` : ""}${reviewHtml(st.last)}</div>
       <div class="acts"><label>Hari <select id="rvDays">${[7, 14, 30, 60].map(d => `<option ${d === ((st.last && st.last.days) || 30) ? "selected" : ""}>${d}</option>`).join("")}</select></label>
         <button class="btn go" id="rvRun" ${st.running ? "disabled" : ""}>Hitung${st.last ? " ulang" : ""}</button>
@@ -1232,6 +1404,49 @@ async function openReview() {
     } catch (e) { $("#modalCard").innerHTML = `<p class="neg">✗ ${esc(e.message || e)}</p>`; }
   };
   poll();
+}
+
+// ---------- 🩺 Health & RPC Meter Modal ----------
+async function openHealth() {
+  $("#modalCard").classList.add("wide");
+  $("#modal").classList.remove("hidden");
+  $("#modalCard").innerHTML = `<h3>🩺 System Health & RPC Meter</h3><p class="muted">Memuat…</p>`;
+  try {
+    const h = await getJson("/api/health");
+    const rpc = h.rpc || {};
+    const loops = Object.entries(h.loops || {}).map(([k, v]) => {
+      const ago = v.okAt ? `${Math.round((Date.now() / 1000 - v.okAt))}s lalu` : "--";
+      return `<tr><td><b>${esc(k)}</b></td><td>${v.error ? `<span class="neg">✗ ${esc(v.error)}</span>` : `<span class="pos">✓ ${esc(v.note || "ok")}</span>`}</td><td>${ago}</td></tr>`;
+    }).join("") || `<tr><td colspan="3" class="muted">belum ada tick daemon</td></tr>`;
+    const land = (rpc.landing || []).map(l => `<div>${esc(l)}</div>`).join("");
+    $("#modalCard").innerHTML = `<h3>🩺 System Health & RPC Meter</h3>
+      <div class="rv">
+        <p>Status auto-trade: <b class="${h.paused ? "neg" : "pos"}">${h.paused ? "⏸ PAUSED (semua auto-exit/flip/re-entry ditahan)" : "▶ AKTIF"}</b> · Telegram 2-way bot: <b>${h.tgConfigured ? "terkonfigurasi" : "belum diset"}</b></p>
+        <h4>DAEMON LOOPS (INDEPENDENT THREADS)</h4>
+        <table><tr><th>Loop</th><th>Status</th><th>Last OK</th></tr>${loops}</table>
+        <h4>HELIUS RPC & LANDING (${rpc.days || 30} HARI TERAKHIR)</h4>
+        <p>Total request: <b>${(rpc.total || 0).toLocaleString()}</b> · Helius: <b>${(rpc.helius || 0).toLocaleString()}</b> (pace ≈ <b>${(rpc.pace30d || 0).toLocaleString()}</b> / 30 hari) · Public: ${(rpc.public || 0).toLocaleString()} · ${rpc.runs || 0} executor runs</p>
+        <pre style="font-size:11.5px;white-space:pre-wrap;background:#0b0e12;padding:8px;border-radius:6px;border:1px solid var(--line)">${land}</pre>
+      </div>
+      <div class="acts"><button class="btn" id="hToggle">${h.paused ? "▶ Resume Auto-Trade" : "⏸ Pause Auto-Trade"}</button><span class="spacer"></span><button class="btn" id="hClose">Tutup</button></div>`;
+    $("#hClose").onclick = closeModal;
+    $("#hToggle").onclick = async () => { await togglePause(); openHealth(); };
+  } catch (e) {
+    $("#modalCard").innerHTML = `<p class="neg">✗ ${esc(e.message || e)}</p><div class="acts"><button class="btn" id="hClose">Tutup</button></div>`;
+    $("#hClose").onclick = closeModal;
+  }
+}
+
+async function togglePause() {
+  try {
+    const res = await trade.call("/api/pause", {});
+    state.paused = !!res.paused;
+    if (state.cfg) state.cfg.paused = state.paused;
+    if (state.pf) state.pf.paused = state.paused;
+    paintPause();
+    if (state.pf) renderPortfolio();
+    toast(state.paused ? "⏸ Semua auto-trade PAUSED" : "▶ Auto-trade RESUMED");
+  } catch (e) { alert("Gagal ubah pause: " + (e.message || e)); }
 }
 
 // ---------- 📡 live activity: close / swap / re-entry / open, step by step ----------
@@ -1302,13 +1517,15 @@ document.addEventListener("keydown", e => {
   if (/INPUT|SELECT|TEXTAREA/.test((e.target && e.target.tagName) || "")) return;
   if (e.key === "/") { e.preventDefault(); setView("pools"); $("#q").focus(); }        // search
   else if (e.key === "u") setUnit(state.unit === "sol" ? "usd" : "sol");                // unit
-  else if (e.key >= "1" && e.key <= "5") setMode(["all", "pass", "ping", "watch", "pick"][+e.key - 1]);
+  else if (e.key >= "1" && e.key <= "5") setMode(["all", "pass", "ping", "pick", "watch"][+e.key - 1]);
 });
 $("#stAge").onclick = () => loadPools(true);
+$("#pauseBtn").onclick = togglePause;
+$("#healthBtn").onclick = openHealth;
 // The key chip: re-reads the server's config first (the server re-reads .env each time), so a key
 // pasted into .env shows up without restarting anything; if it still isn't read, says why.
 $("#keyBtn").onclick = async () => {
-  try { state.cfg = await getJson("/api/config"); trade.info = state.cfg && state.cfg.trade; paintWallet(); } catch (e) {}
+  try { state.cfg = await getJson("/api/config"); trade.info = state.cfg && state.cfg.trade; paintWallet(); paintPause(); } catch (e) {}
   if (trade.ready()) {
     $("#wallet").value = trade.info.wallet;
     return alert(`Trading wallet: ${trade.info.wallet}${trade.info.pin ? "\nPIN aktif (DLMM_WEB_PIN)." : "\nTrading cuma dari Mac ini."}`);
@@ -1332,7 +1549,7 @@ $("#positions tbody").addEventListener("click", onPfClick);
 $("#pfCards").addEventListener("click", onPfClick);
 $("#pfCards").addEventListener("change", e => { const s = e.target.closest("[data-tp]"); if (s) setAutoExit(s); });
 $("#cleanupBtn2").onclick = () => cleanupWallet($("#cleanupBtn2"));
-// phone bottom bar: pools (ALL / V1 / PING / WATCH) and portfolio
+// phone bottom bar: pools (ALL / V1 / PING / PICK / WATCH) and portfolio
 document.querySelectorAll("#bottomnav button").forEach(b => b.onclick = () => {
   document.body.classList.remove("sheet");
   if (b.dataset.view === "portfolio") return setView("portfolio");
@@ -1368,11 +1585,13 @@ $("#wallet").addEventListener("keydown", e => { if (e.key === "Enter") loadPortf
   $("#poolsEmpty").classList.remove("hidden");
   const pools = loadPools();                       // don't wait on anything else first
   try { state.cfg = await getJson("/api/config"); } catch (e) {}
+  state.paused = !!(state.cfg && state.cfg.paused);
   const tw = state.cfg && state.cfg.trade && state.cfg.trade.wallet;
   $("#wallet").value = tw || store.get("wallet", "") || (state.cfg && state.cfg.wallet) || "";
   try { setView(store.get("view", "pools")); } catch (e) { setView("pools"); }
   trade.info = state.cfg && state.cfg.trade;
   paintWallet();
+  paintPause();
   await pools;
   loadWatch();
   loadPing();

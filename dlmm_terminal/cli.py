@@ -156,16 +156,19 @@ def _tg_chunks(text: str, limit: int = 4000) -> list[str]:
     return out + ([cur] if cur else [])
 
 
-def notify(text: str, html: str | None = None) -> None:
+def notify(text: str, html: str | None = None, reply_markup: dict | None = None) -> None:
     """Print `text`; send it to Telegram when configured. `html` = Telegram-HTML version to send instead."""
     print(text, flush=True)
     token, chat = os.environ.get("DLMM_TG_BOT_TOKEN"), os.environ.get("DLMM_TG_CHAT_ID")
     if token and chat:
-        for chunk in _tg_chunks(html or text):
+        chunks = _tg_chunks(html or text)
+        for idx, chunk in enumerate(chunks):
             try:
                 fields = {"chat_id": chat, "text": chunk, "disable_web_page_preview": "true"}
                 if html:
                     fields["parse_mode"] = "HTML"
+                if reply_markup and idx == len(chunks) - 1:
+                    fields["reply_markup"] = json.dumps(reply_markup)
                 api.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", timeout=10,
                             data=urllib.parse.urlencode(fields).encode()).read()
             except Exception as exc:  # alerts must never kill the monitor
@@ -335,8 +338,8 @@ def cmd_decide(a, cfg):
 
 # ---------- monitor (auto TP / exits) ----------
 
-def ticks_for_wallet(wallet: str, now: float):
-    for p in api.open_portfolio(wallet):
+def ticks_for_wallet(wallet: str, now: float, open_pools: list[dict] | None = None):
+    for p in (open_pools if open_pools is not None else api.open_portfolio(wallet)):
         side = "y" if p.get("tokenYMint") == api.SOL_MINT else "x" if p.get("tokenXMint") == api.SOL_MINT else None
         if side is None:
             continue
@@ -805,31 +808,60 @@ def _new_entrants(hits: list, cfg: dict, prof: dict, state: dict, now: float) ->
 
 
 def _wallet_entries(cfg: dict, prof: dict, state: dict, now: float) -> list[dict]:
-    """Ping when the benchmark wallet opens a position in a pool it wasn't in on the last tick."""
-    wallet = prof["wallet"]
-    try:
-        open_now = {p["poolAddress"] for p in api.open_portfolio(wallet)}
-    except Exception as exc:
-        print(f"benchmark wallet poll failed: {exc}", file=sys.stderr)
+    """Ping when any tracked benchmark wallet opens a position in a pool it wasn't in on the last tick.
+    Supports `signal.benchmarkWallets` (list of extra smart LP wallets) and fires a 🔥 SMART LP CONSENSUS
+    alert if >= 2 tracked wallets enter the same pool within 1 hour."""
+    sig = cfg.get("signal") or {}
+    wallets = []
+    for w in [prof.get("wallet"), *(sig.get("benchmarkWallets") or [])]:
+        if w and w not in wallets:
+            wallets.append(w)
+    if not wallets:
         return []
-    first = "walletPools" not in state
-    new = open_now - set(state.get("walletPools", []))
-    state["walletPools"] = sorted(open_now)
-    if first:  # don't blast the positions that were already open when the watcher started
-        return []
+    # Backwards-compat: primary wallet still mirrors state["walletPools"]
+    by_wallet = state.setdefault("walletPoolsByWallet", {})
+    if "walletPools" in state and wallets[0] not in by_wallet:
+        by_wallet[wallets[0]] = list(state["walletPools"])
+    recent = state.setdefault("recentWalletEntries", {})   # pool -> {wallet: ts}
     out = []
-    for pool in sorted(new):
+    for wallet in wallets:
         try:
-            c, m = _candidate(api.pool(pool), cfg, prof, with_candles=True, now=now)
+            open_now = {p["poolAddress"] for p in api.open_portfolio(wallet)}
         except Exception as exc:
-            notify(f"👀 benchmark {_short(wallet)} entered {pool} (detail failed: {exc})")
+            print(f"benchmark wallet poll failed ({_short(wallet)}): {exc}", file=sys.stderr)
             continue
-        notify(signal_message(c, m, prof, f"👀 BENCHMARK WALLET ENTERED ({_short(wallet)})"))
-        row = {"ts": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"), "kind": "walletEntry",
-               "pool": pool, "symbol": c["symbol"], "gatesFailed": c["gatesFailed"], "score": m["score"],
-               "flags": c["flags"], "priceSol": c["priceSol"]}
-        append("signals.jsonl", row)
-        out.append(row)
+        first = wallet not in by_wallet
+        new = open_now - set(by_wallet.get(wallet, []))
+        by_wallet[wallet] = sorted(open_now)
+        if wallet == wallets[0]:
+            state["walletPools"] = by_wallet[wallet]
+        if first:  # don't blast positions already open when the watcher started
+            continue
+        for pool in sorted(new):
+            pool_rec = recent.setdefault(pool, {})
+            pool_rec[wallet] = now
+            # prune entries older than 1 hour
+            pool_rec = {w: t for w, t in pool_rec.items() if now - t <= 3600}
+            recent[pool] = pool_rec
+            consensus = len(pool_rec) >= 2
+            head = (f"🔥 SMART LP CONSENSUS ({len(pool_rec)} wallets: {', '.join(_short(w) for w in pool_rec)})"
+                    if consensus else f"👀 BENCHMARK WALLET ENTERED ({_short(wallet)})")
+            try:
+                c, m = _candidate(api.pool(pool), cfg, prof, with_candles=True, now=now)
+            except Exception as exc:
+                notify(f"{head} → {pool} (detail failed: {exc})")
+                continue
+            notify(signal_message(c, m, prof, head))
+            row = {"ts": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
+                   "kind": "walletConsensus" if consensus else "walletEntry",
+                   "wallet": wallet, "wallets": list(pool_rec) if consensus else [wallet],
+                   "pool": pool, "symbol": c["symbol"], "gatesFailed": c["gatesFailed"], "score": m["score"],
+                   "flags": c["flags"], "priceSol": c["priceSol"]}
+            append("signals.jsonl", row)
+            out.append(row)
+    # prune old consensus tracking
+    for p in [p for p, rec in recent.items() if not any(now - t <= 3600 for t in rec.values())]:
+        recent.pop(p, None)
     return out
 
 

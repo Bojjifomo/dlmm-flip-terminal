@@ -322,3 +322,32 @@ tbody tr.sibrow td:first-child { box-shadow: inset 3px 0 0 #275a88; }
 .activity .spin { display: inline-block; animation: actspin 1.2s linear infinite; }
 @keyframes actspin { to { transform: rotate(360deg); } }
 @media (max-width: 640px) { .activity { left: 8px; right: 8px; width: auto; bottom: calc(64px + env(safe-area-inset-bottom)); max-height: 45vh; } }
+
+/* Safety, Narrative pills, Regime, Exposure, Quick-Skip, IL Breakeven */
+.ntag { font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 6px; margin-left: 4px; vertical-align: middle; }
+.ntag.KUAT { background: rgba(61,220,132,.18); color: #3ddc84; }
+.ntag.SEDANG { background: rgba(245,185,66,.18); color: #f5b942; }
+.ntag.LEMAH { background: rgba(150,150,150,.18); color: #aaa; }
+.ntag.BAHAYA { background: rgba(255,90,95,.2); color: #ff5a5f; }
+.mom { font-size: 10.5px; margin-left: 4px; }
+.chip.paused { background: rgba(255,90,95,.2); border-color: #ff5a5f; color: #ff5a5f; }
+.chip.riskoff { background: rgba(255,90,95,.18); border-color: #ff5a5f; color: #ff5a5f; }
+.chip.caution { background: rgba(245,185,66,.16); border-color: #f5b942; color: #f5b942; }
+.safety { margin: 8px 16px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font-size: 12px; }
+.safety.DANGER { border-color: rgba(255,90,95,.55); background: rgba(255,90,95,.07); }
+.safety.WARN { border-color: rgba(245,185,66,.45); background: rgba(245,185,66,.06); }
+.safety.OK { border-color: rgba(61,220,132,.35); background: rgba(61,220,132,.05); }
+.qskip { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; margin: 6px 16px; font-size: 11.5px; }
+.qskip button { background: transparent; border: 1px solid #2c3746; color: var(--muted); border-radius: 8px; padding: 2px 7px; font-size: 11px; cursor: pointer; }
+.qskip button:hover { color: var(--text); border-color: var(--accent); }
+.extlinks { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11.5px; margin: 4px 16px 6px; }
+.expbar { gap: 14px; font-size: 12px; flex-wrap: wrap; background: rgba(255,255,255,.02); }
+.expbar:empty { display: none; }
+.stalebadge { display: inline-block; padding: 1px 6px; border-radius: 6px; font-size: 11px; background: rgba(92,168,255,.18); color: #79b8ff; margin-top: 3px; }
+.zpresets { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 8px 0 4px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; }
+.zpresets label { display: inline-flex; align-items: center; gap: 4px; }
+.ilbox { margin-top: 8px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; font-size: 11.5px; }
+.ilbox table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+.ilbox td, .ilbox th { padding: 2px 6px; text-align: right; border-bottom: 1px solid #1a2029; }
+.ilbox td:first-child, .ilbox th:first-child { text-align: left; }
+

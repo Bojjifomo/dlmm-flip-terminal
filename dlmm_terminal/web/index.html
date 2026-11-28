@@ -22,12 +22,15 @@
   </nav>
   <div class="stat" id="stNet">posisi <b>--</b></div>
   <div class="stat" id="stSol">SOL <b>--</b></div>
+  <div class="chip hidden" id="stRegime" title="Market regime: SOL 1h + breadth pool DLMM"></div>
   <div class="stat" id="stFees">fees unclaimed <b>--</b></div>
   <div class="stat" id="stWallet" title="SOL di wallet (bebas, belum di posisi)">wallet <b>--</b></div>
   <div class="spacer"></div>
   <div class="seg unit" id="unit" title="Baca semua angka dalam SOL atau USD"><button data-u="sol">◎ SOL</button><button data-u="usd">$ USD</button></div>
+  <button class="chip" id="pauseBtn" title="Kill-switch: pause / resume semua auto-exit, auto-flip, auto-reentry">▶ Auto</button>
+  <button class="chip" id="healthBtn" title="System Health, Daemon Loops, dan Pemakaian RPC Helius + Landing Time">🩺 RPC</button>
   <button class="chip" id="bellBtn" title="Notifikasi browser: pool baru masuk PING, exit alert">🔕</button>
-  <button class="chip" id="setBtn" title="Settings: ladder, risk, gate, flag, PING, exit">⚙</button>
+  <button class="chip" id="setBtn" title="Settings: ladder, risk, gate, flag, PING, exit, flip, re-entry, tx">⚙</button>
   <a class="chip" href="https://app.meteora.ag/dlmm" target="_blank" rel="noopener" title="Meteora">○ MET</a>
   <button class="chip key" id="keyBtn" title="Trading wallet">🔒 read-only</button>
   <div class="chip" id="stCap" title="max position = bankroll × loss budget ÷ 0.9">max --</div>
@@ -87,6 +90,7 @@
       <button class="btn" id="reviewBtn" title="Review ladder lu N hari terakhir: koin mana yang beneran ngasih, dan filter mana yang kebukti">📊 Review</button>
     </div>
     <div class="bar summary" id="pfSummary"></div>
+    <div class="bar expbar" id="pfExposure"></div>
     <div class="bar" id="pfAuto" style="flex-direction:column;align-items:flex-start;gap:2px"></div>
     <div class="left-tokens" id="pfTokens"></div>
     <div class="tablewrap">
@@ -142,6 +146,6 @@
     }, 8000);
   })();
 </script>
-<script src="app.js?v=18"></script>
+<script src="app.js?v=19"></script>
 </body>
 </html>

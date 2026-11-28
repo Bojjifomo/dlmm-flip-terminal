@@ -22,11 +22,12 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import api, exits, filters, flip, narrative, node, reentry, review, settings
+from . import api, exits, filters, flip, narrative, node, reentry, review, safety, settings, tgbot
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "web"
@@ -98,8 +99,31 @@ def verdict(c: dict, m: dict | None) -> dict:
     return {"level": level, "score": score, "reasons": bad + good, "info": info}
 
 
+def _sol_changes() -> tuple[float | None, float | None]:
+    """SOL 1h and 24h % moves from DexScreener (cached 5 min, 0 RPC)."""
+    key = ("sol_chg",)
+    with _lock:
+        hit = _cache.get(key)
+        if hit and time.time() - hit["t"] < 300:
+            return hit["data"]
+    c1, c24 = None, None
+    try:
+        pairs = _get_json("https://api.dexscreener.com/tokens/v1/solana/" + api.SOL_MINT, timeout=8) or []
+        best = max((p for p in pairs if (p.get("quoteToken") or {}).get("symbol") in ("USDC", "USDT")),
+                   key=lambda p: (p.get("liquidity") or {}).get("usd") or 0, default=None)
+        if best:
+            pc = best.get("priceChange") or {}
+            c1 = pc.get("h1")
+            c24 = pc.get("h24")
+    except Exception:
+        pass
+    with _lock:
+        _cache[key] = {"t": time.time(), "data": (c1, c24)}
+    return c1, c24
+
+
 def _build_rows(snaps: list[dict], cfg: dict):
-    """Meteora pool snapshots -> table rows (spec v1 verdict, fees per window, DexScreener moves)."""
+    """Meteora pool snapshots -> table rows (spec v1 verdict, fees per window, DexScreener moves, fee momentum, cached narrative tag)."""
     market = dex_market([p["address"] for p in snaps])
     now = datetime.now(timezone.utc)
     out = []
@@ -109,6 +133,7 @@ def _build_rows(snaps: list[dict], cfg: dict):
         v = verdict(c, m)
         tvl = snap.get("tvl") or 0
         fees, vol = snap.get("fees") or {}, snap.get("volume") or {}
+        narr = narrative.cached(c["tokenMint"]) if c.get("tokenMint") else None
         out.append({
             **{k: c[k] for k in ("pool", "name", "symbol", "tokenMint", "solSide", "poolAgeHours", "tvlUsd", "feeApr1h",
                                  "feeApr24h", "volTvl24h", "volMcap24h", "mcapUsd", "priceChg1h", "priceChg6h", "priceChg24h", "binStep",
@@ -117,6 +142,8 @@ def _build_rows(snaps: list[dict], cfg: dict):
             # fees per window, and the same as % of TVL per day at that window's pace
             "fees": {w: fees.get(w) or 0 for w in ("1h", "4h", "24h")},
             "feePctDay": {w: (fees.get(w) or 0) / tvl * 100 * 24 / h if tvl else 0 for w, h in (("1h", 1), ("4h", 4), ("24h", 24))},
+            "feeMomentum": safety.fee_momentum(fees.get("1h"), fees.get("24h"), c.get("poolAgeHours")),
+            "narrativeTag": (narr or {}).get("tag") if (narr or {}).get("ok") else None,
             "chg5m": ((m or {}).get("chg") or {}).get("5m"), "icon": (m or {}).get("icon"),
             "priceUsd": filters.token_of(snap).get("price") if filters.sol_side(snap) else None,
             "verdict": v,
@@ -127,7 +154,7 @@ def _build_rows(snaps: list[dict], cfg: dict):
 
 def token_pools(cfg: dict, mint: str) -> dict:
     """Every Meteora DLMM pool of one token against SOL, without the list's TVL / fee prefilter
-    (the list hides a token's quieter pools), deepest first. Cached two minutes."""
+    (the list hides a token's quieter pools), deepest first. Includes DLMM volume share %. Cached two minutes."""
     key = ("token", mint)
     with _lock:
         hit = _cache.get(key)
@@ -141,20 +168,32 @@ def token_pools(cfg: dict, mint: str) -> dict:
                 snaps.append(r)
     rows, _, _ = _build_rows(snaps, cfg) if snaps else ([], None, None)
     rows.sort(key=lambda r: -(r.get("tvlUsd") or 0))
-    # The token's pools on other venues (pump.fun / PumpSwap / Raydium / DAMM): context only, the terminal LPs on DLMM.
+    # The token's pools on other venues (pump.fun / PumpSwap / Raydium / DAMM): context + DLMM volume share.
     other = []
+    other_vol = 0.0
     try:
         for p in _get_json("https://api.dexscreener.com/token-pairs/v1/solana/" + mint, timeout=10) or []:
             if p.get("pairAddress") in seen:
                 continue
             liq = (p.get("liquidity") or {}).get("usd") or 0
+            v24 = (p.get("volume") or {}).get("h24") or 0
+            other_vol += v24
             other.append({"pair": p.get("pairAddress"), "dex": p.get("dexId"), "labels": p.get("labels") or [],
                           "quote": (p.get("quoteToken") or {}).get("symbol"), "liqUsd": liq,
-                          "vol24": (p.get("volume") or {}).get("h24") or 0, "url": p.get("url")})
+                          "vol24": v24, "url": p.get("url")})
     except Exception:
         pass
+    dlmm_vol = sum(r.get("vol24") or 0 for r in rows)
+    token_vol_24h = dlmm_vol + other_vol
+    for r in rows:
+        r["dlmmVolSharePct"] = safety.dlmm_volume_share(r.get("vol24"), token_vol_24h)
+        r["tokenVol24h"] = round(token_vol_24h, 2) if token_vol_24h else None
+        if token_vol_24h and r.get("mcapUsd"):
+            r["tokenVolMcap24h"] = round(token_vol_24h / r["mcapUsd"], 2)
     other = sorted([o for o in other if o["liqUsd"] >= 100 or o["vol24"] >= 100], key=lambda o: -o["liqUsd"])[:8]
-    data = {"t": time.time(), "mint": mint, "rows": rows, "other": other}
+    data = {"t": time.time(), "mint": mint, "rows": rows, "other": other,
+            "tokenVol24h": round(token_vol_24h, 2),
+            "dlmmTotalSharePct": safety.dlmm_volume_share(dlmm_vol, token_vol_24h)}
     with _lock:
         _cache[key] = {"t": time.time(), "data": data}
     return data
@@ -181,8 +220,10 @@ def pool_rows(cfg: dict, min_tvl: float, force: bool = False) -> dict:
             if len(rows) < s["pageSize"]:
                 break
     out, market, now = _build_rows(snaps, cfg)
+    sol_1h, sol_24h = _sol_changes()
     data = {"t": time.time(), "rows": out, "solUsd": next((r["solUsd"] for r in out if r["solUsd"]), None),
-            "maxPositionSol": filters.max_position_sol(cfg), "sizeSol": filters.planned_size_sol(cfg)}
+            "maxPositionSol": filters.max_position_sol(cfg), "sizeSol": filters.planned_size_sol(cfg),
+            "regime": safety.market_regime(out, sol_1h, sol_24h)}
     with _lock:
         _cache[key] = {"t": time.time(), "data": data}
     try:
@@ -226,11 +267,21 @@ def _pick_notify(rows: list[dict], cfg: dict) -> None:
         return
     fresh.sort(key=lambda r: -(r.get("volMcap24h") or 0))
     lines = [f"🎯 PICK baru ({len(fresh)}): lolos filter review lu"]
+    btns = []
     for r in fresh[:8]:
         lines.append(f"• {r['symbol']} bin {r['binStep']} · 1h {r['priceChg1h']:+.0f}% · vol/mcap {r.get('volMcap24h') or 0:.2f}x"
                      f" · fee {r['feePctDay']['24h']:.0f}%/d · TVL ${r['tvlUsd']:,.0f}")
+    for r in fresh[:3]:
+        cb_n = tgbot.register_cb("narr", {"pool": r["pool"], "mint": r["tokenMint"], "symbol": r["symbol"],
+                                          "mcapUsd": r.get("mcapUsd"), "priceChg1h": r.get("priceChg1h"),
+                                          "priceChg24h": r.get("priceChg24h"), "vol24hUsd": r.get("vol24")})
+        cb_w = tgbot.register_cb("watch", {"pool": r["pool"], "symbol": r["symbol"]})
+        btns.append([
+            {"text": f"🔎 Riset {r['symbol']}", "callback_data": cb_n},
+            {"text": f"★ Watch {r['symbol']}", "callback_data": cb_w},
+        ])
     from .cli import notify
-    notify("\n".join(lines))
+    notify("\n".join(lines), reply_markup={"inline_keyboard": btns} if btns else None)
 
 
 # ---------- PING: the signal filter (v1 gates + GMGN bands - dead→alive), top N ----------
@@ -473,12 +524,82 @@ def auto_disarm(pool: str, why: str) -> bool:
     return True
 
 
+_health_lock = threading.Lock()
+_health: dict[str, dict] = {}
+
+
+def _pause_file():
+    from .cli import DATA
+    return DATA / "paused.json"
+
+
+def is_paused() -> bool:
+    try:
+        return bool(json.loads(_pause_file().read_text()).get("paused"))
+    except (OSError, ValueError):
+        return False
+
+
+def set_paused(on: bool) -> bool:
+    f = _pause_file()
+    f.parent.mkdir(exist_ok=True)
+    f.write_text(json.dumps({"paused": bool(on), "at": time.time()}))
+    return bool(on)
+
+
+def _mark_health(name: str, error: str | None = None, note: str | None = None) -> None:
+    with _health_lock:
+        rec = _health.setdefault(name, {"okAt": None, "error": None, "errStreak": 0, "note": None})
+        if error:
+            rec["error"] = error[:200]
+            rec["errAt"] = time.time()
+            rec["errStreak"] = int(rec.get("errStreak") or 0) + 1
+        else:
+            rec["okAt"] = time.time()
+            rec["error"] = None
+            rec["errStreak"] = 0
+        if note is not None:
+            rec["note"] = note
+
+
+def health_report(cfg: dict, days: float = 30) -> dict:
+    """System health, daemon loop status, pause state, and 30d Helius RPC / tx landing summary."""
+    from .cli import tx_landing_lines
+    rows = []
+    if node.USAGE_LOG.exists():
+        try:
+            since = datetime.now(timezone.utc).timestamp() - days * 86400
+            for l in node.USAGE_LOG.read_text().splitlines():
+                if not l.strip():
+                    continue
+                r = json.loads(l)
+                if datetime.fromisoformat(r["ts"]).timestamp() >= since:
+                    rows.append(r)
+        except Exception:
+            pass
+    helius = sum((r.get("byHost") or {}).get("helius", 0) for r in rows)
+    public = sum((r.get("byHost") or {}).get("public", 0) for r in rows)
+    total = sum(r.get("calls", 0) for r in rows)
+    pace30 = int(round(helius / max(days, 1) * 30))
+    with _health_lock:
+        loops = {k: dict(v) for k, v in _health.items()}
+    return {
+        "ok": True,
+        "paused": is_paused(),
+        "loops": loops,
+        "tgConfigured": bool(os.environ.get("DLMM_TG_BOT_TOKEN") and os.environ.get("DLMM_TG_CHAT_ID")),
+        "rpc": {"days": days, "total": total, "helius": helius, "public": public,
+                "pace30d": pace30, "runs": len(rows), "landing": tx_landing_lines(rows)},
+    }
+
+
 def _ladders(wallet: str) -> dict:
     """{pool: {"symbol", "positions": [...], "pnlSol", "depositSol", "pnlPct"}} from Meteora's data API."""
     from .cli import ticks_for_wallet
-    meta = {p["poolAddress"]: p for p in api.open_portfolio(wallet)}
+    open_pools = api.open_portfolio(wallet)
+    meta = {p["poolAddress"]: p for p in open_pools}
     out: dict = {}
-    for t in ticks_for_wallet(wallet, time.time()):
+    for t in ticks_for_wallet(wallet, time.time(), open_pools=open_pools):
         g = out.setdefault(t.pool, {"symbol": t.symbol, "positions": []})
         g["positions"].append(t.position)
     for pool, g in out.items():
@@ -688,8 +809,8 @@ def flip_run(cfg: dict, pool: str, position: str, to: str, symbol: str = "", for
 
 
 def flip_once(cfg: dict, wallet: str) -> list[dict]:
-    """One pass over the armed pools: update every position's flip state, send the flips that are due (auto) or
-    say they are ready (alert)."""
+    """One pass over the armed pools: update every position's flip state, detect stale asks, send the flips
+    that are due (auto, up to parallelSlices at once) or alert with a Telegram Flip button."""
     from .cli import notify, ticks_for_wallet
     with _auto_lock:
         armed = dict(flip_load()["pools"])
@@ -714,7 +835,12 @@ def flip_once(cfg: dict, wallet: str) -> list[dict]:
             decided += [(t, raw, st, g) for (t, raw, st, _), g in zip(items, gated)]
         for t, raw, st, dec in decided:
             seen.add(t.position)
-            raw.update(st.to_dict(), pool=t.pool, msg=dec.msg, ready=dec.kind == "flip", to=dec.to)
+            # Stale Ask check (ask sitting below range earning 0 new fees for >= staleAskHours)
+            stale = flip.check_stale_ask(now, t.price, t.range_min, t.pnl_sol, st, fc)
+            raw.update(st.to_dict(), pool=t.pool, msg=dec.msg, ready=dec.kind == "flip", to=dec.to,
+                       staleAsk=stale if stale else None)
+            if stale and stale.get("notify"):
+                notify(f"🧊 STALE ASK {t.symbol} {t.position[:6]}…: {stale['msg']}")
             if dec.kind == "wait":
                 raw.pop("error", None)
                 raw.pop("errorAt", None)
@@ -726,18 +852,29 @@ def flip_once(cfg: dict, wallet: str) -> list[dict]:
                         due.append((t, dec))
                 elif not st.notified:
                     raw["notified"] = True
-                    notify(f"🔁 FLIP SIAP {t.symbol} {t.position[:6]}…: {dec.msg}. Klik Flip di Portfolio (mode alert).")
+                    cb = tgbot.register_cb("flip", {"pool": t.pool, "position": t.position, "to": dec.to, "symbol": t.symbol})
+                    kb = {"inline_keyboard": [[{"text": f"🔁 Flip {t.symbol} → {dec.to}", "callback_data": cb}]]}
+                    notify(f"🔁 FLIP SIAP {t.symbol} {t.position[:6]}…: {dec.msg}. Klik Flip di Portfolio atau tombol di bawah.",
+                           reply_markup=kb)
         # forget positions of armed pools that are gone (closed / flipped)
         # (a position a flip just opened is kept 30 min: Meteora's API lists it a few minutes late)
         for pos in [p for p, v in d["positions"].items() if v.get("pool") in armed and p not in seen
                     and not (v.get("fresh") and now - v["fresh"] < 1800)]:
             d["positions"].pop(pos)
         flip_save(d)
-    done = []
-    for t, dec in due:
+    if not due:
+        return []
+    par = max(1, int((cfg.get("tx") or {}).get("parallelSlices", 3)))
+
+    def _one(item):
+        t, dec = item
         res = flip_run(cfg, t.pool, t.position, dec.to, t.symbol, source="auto")
-        done.append({"pool": t.pool, "position": t.position, "to": dec.to, "ok": bool(res.get("ok"))})
-    return done
+        return {"pool": t.pool, "position": t.position, "to": dec.to, "ok": bool(res.get("ok"))}
+
+    if par == 1 or len(due) == 1:
+        return [_one(item) for item in due]
+    with ThreadPoolExecutor(max_workers=min(par, len(due))) as ex:
+        return list(ex.map(_one, due))
 
 
 # ---------- auto re-entry (per pool: off / on) ----------
@@ -866,20 +1003,74 @@ def reentry_once(cfg: dict, wallet: str) -> list[dict]:
     return done
 
 
-def _auto_loop(cfg: dict) -> None:
+def _loop_auto_exit(cfg: dict) -> None:
     import sys
     while True:
         try:
-            tw = node.trade_wallet()
-            if tw.get("ok") and auto_load():
-                auto_exit_once(cfg, tw["pubkey"])
-            if tw.get("ok") and flip_load()["pools"]:
-                flip_once(cfg, tw["pubkey"])
-            if tw.get("ok") and reentry_load()["pools"]:
-                reentry_once(cfg, tw["pubkey"])
+            if is_paused():
+                _mark_health("autoExit", None, "paused")
+            else:
+                tw = node.trade_wallet()
+                if tw.get("ok") and auto_load():
+                    auto_exit_once(cfg, tw["pubkey"])
+                _mark_health("autoExit", None, "ok")
         except Exception as exc:
+            _mark_health("autoExit", str(exc))
             print(f"[auto-exit] {exc}", file=sys.stderr, flush=True)
         time.sleep(max(1, float((cfg.get("web") or {}).get("autoExitCheckMin", 2))) * 60)
+
+
+def _loop_flip(cfg: dict) -> None:
+    import sys
+    while True:
+        try:
+            if is_paused():
+                _mark_health("flip", None, "paused")
+            else:
+                tw = node.trade_wallet()
+                if tw.get("ok") and flip_load()["pools"]:
+                    flip_once(cfg, tw["pubkey"])
+                _mark_health("flip", None, "ok")
+        except Exception as exc:
+            _mark_health("flip", str(exc))
+            print(f"[flip] {exc}", file=sys.stderr, flush=True)
+        time.sleep(max(1, float((cfg.get("web") or {}).get("autoExitCheckMin", 2))) * 60)
+
+
+def _loop_reentry(cfg: dict) -> None:
+    import sys
+    while True:
+        try:
+            if is_paused():
+                _mark_health("reentry", None, "paused")
+            else:
+                tw = node.trade_wallet()
+                if tw.get("ok") and reentry_load()["pools"]:
+                    reentry_once(cfg, tw["pubkey"])
+                _mark_health("reentry", None, "ok")
+        except Exception as exc:
+            _mark_health("reentry", str(exc))
+            print(f"[reentry] {exc}", file=sys.stderr, flush=True)
+        time.sleep(max(1, float((cfg.get("web") or {}).get("autoExitCheckMin", 2))) * 60)
+
+
+def _loop_pick_bg(cfg: dict) -> None:
+    """Background 🎯 PICK scanner so Telegram alerts fire 24/7 even when no browser tab is open."""
+    import sys
+    time.sleep(15)   # let server start cleanly first
+    while True:
+        mins = float((cfg.get("web") or {}).get("backgroundPickMin", 5) or 0)
+        if mins <= 0:
+            _mark_health("pickBg", None, "off")
+            time.sleep(60)
+            continue
+        try:
+            pool_rows(cfg, 2000, force=True)
+            _mark_health("pickBg", None, "ok")
+        except Exception as exc:
+            _mark_health("pickBg", str(exc))
+            print(f"[pick-bg] {exc}", file=sys.stderr, flush=True)
+        time.sleep(max(1.0, mins) * 60)
 
 
 def portfolio(wallet: str, cfg: dict) -> dict:
@@ -890,17 +1081,21 @@ def portfolio(wallet: str, cfg: dict) -> dict:
         states = json.loads(state_file.read_text())
     except Exception:
         states = {}
-    meta = {p["poolAddress"]: p for p in api.open_portfolio(wallet)}
+    open_pools = api.open_portfolio(wallet)
+    meta = {p["poolAddress"]: p for p in open_pools}
     fl = flip_load()
     rows, seen = [], set()
-    for t in ticks_for_wallet(wallet, now):
+    for t in ticks_for_wallet(wallet, now, open_pools=open_pools):
         seen.add(t.position)
         st = exits.State.from_dict(states.get(t.position))
         ev = exits.evaluate(t, st, flip.exits_for(cfg["exits"], t.pool in fl["pools"]))
         states[t.position] = st.to_dict()
         p = meta.get(t.pool, {})
+        mint = p.get("tokenXMint") if p.get("tokenYMint") == api.SOL_MINT else p.get("tokenYMint")
+        fl_pos = (fl.get("positions") or {}).get(t.position) or {}
         rows.append({
-            "position": t.position, "pool": t.pool, "symbol": t.symbol, "pnlPct": t.pnl_pct, "pnlSol": t.pnl_sol,
+            "position": t.position, "pool": t.pool, "symbol": t.symbol, "tokenMint": mint,
+            "pnlPct": t.pnl_pct, "pnlSol": t.pnl_sol,
             "peakPnlPct": st.peak_pnl, "solOnly": t.sol_only,
             "priceVsTopPct": (t.price / t.range_max - 1) * 100 if t.range_max else None,
             "rangeBottomPct": (t.range_min / t.range_max - 1) * 100 if t.range_max else None,
@@ -911,6 +1106,7 @@ def portfolio(wallet: str, cfg: dict) -> dict:
             "poolPnlSol": p.get("pnlSol"), "poolDepositSol": p.get("totalDepositSol"),
             "poolPnlPct": p.get("pnlSolPctChange") if p.get("pnlSolPctChange") is not None else p.get("pnlPctChange"),
             "rangeMax": t.range_max, "rangeMin": t.range_min, "price": t.price,
+            "staleAsk": fl_pos.get("staleAsk"),
         })
     for gone in set(states) - seen:
         states.pop(gone)
@@ -918,8 +1114,41 @@ def portfolio(wallet: str, cfg: dict) -> dict:
     state_file.write_text(json.dumps(states))
     pools = list(meta.values())
     f = lambda k: sum(float(p.get(k) or 0) for p in pools)
-    return {"wallet": wallet, "t": now, "rows": rows, "valueSol": f("balancesSol"), "unclaimedSol": f("unclaimedFeesSol"),
-            "pnlSol": f("pnlSol"), "depositSol": f("totalDepositSol"), "exitsCfg": cfg["exits"],
+    val_sol = f("balancesSol")
+    dep_sol = f("totalDepositSol")
+    bankroll = float((cfg.get("position") or {}).get("bankrollSol") or 0)
+    # Portfolio-level risk & exposure breakdown (SOL-only vs token-exposed ladders)
+    by_pool: dict[str, list[dict]] = {}
+    for r in rows:
+        by_pool.setdefault(r["pool"], []).append(r)
+    sol_only_pools = 0
+    tok_exp_pools = 0
+    sol_only_sol = 0.0
+    tok_exp_sol = 0.0
+    open_mints = sorted({r["tokenMint"] for r in rows if r.get("tokenMint")})
+    for pool_addr, rs in by_pool.items():
+        holds_tok = any((not r["solOnly"]) or r["inRange"] or r["below"] for r in rs)
+        b_sol = float((meta.get(pool_addr) or {}).get("balancesSol") or 0)
+        if holds_tok:
+            tok_exp_pools += 1
+            tok_exp_sol += b_sol
+        else:
+            sol_only_pools += 1
+            sol_only_sol += b_sol
+    exposure = {
+        "bankrollSol": bankroll,
+        "deployedSol": round(val_sol, 3),
+        "deployedPct": round(val_sol / bankroll * 100, 1) if bankroll > 0 else None,
+        "pools": len(by_pool),
+        "solOnlyPools": sol_only_pools,
+        "tokenExposedPools": tok_exp_pools,
+        "solOnlySol": round(sol_only_sol, 3),
+        "tokenExposedSol": round(tok_exp_sol, 3),
+        "openMints": open_mints,
+    }
+    return {"wallet": wallet, "t": now, "rows": rows, "valueSol": val_sol, "unclaimedSol": f("unclaimedFeesSol"),
+            "pnlSol": f("pnlSol"), "depositSol": dep_sol, "exitsCfg": cfg["exits"],
+            "exposure": exposure, "paused": is_paused(),
             "walletSol": wallet_sol(wallet), "autoExit": auto_load(), "tpChoices": TP_CHOICES,
             "autoReentry": {"pools": reentry_load()["pools"], "cfg": reentry_cfg(cfg)},
             "flip": {"pools": fl["pools"], "positions": fl["positions"], "history": (fl.get("history") or [])[-20:], "cfg": flip_cfg(cfg)},
@@ -994,6 +1223,19 @@ def _trade_exec(path: str, cfg: dict, body: dict) -> dict:
                                    "decision": "enter", "sizeSol": sol, "override": bool(body.get("override")),
                                    "positions": [r.get("position") for r in res.get("results", [])], "ok": res.get("ok"),
                                    "error": res.get("error")})
+        if res.get("ok") and not retry:
+            pool_addr, sym = str(body["pool"]), str(body.get("symbol") or "")
+            if body.get("armFlip") in ("alert", "auto"):
+                flip_set(pool_addr, sym, str(body["armFlip"]))
+            if body.get("armReentry"):
+                reentry_set(pool_addr, sym, True, str(body.get("strategy") or "spot"))
+            if body.get("armTp"):
+                try:
+                    tp = float(body["armTp"])
+                    if 0.5 <= tp <= 100:
+                        auto_set(pool_addr, sym, tp)
+                except (TypeError, ValueError):
+                    pass
         return res
     if path.endswith("/flip"):
         to = str(body["to"])
@@ -1060,6 +1302,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if u.path == "/api/pools":
                 return self._json(pool_rows(self.cfg, float(q.get("tvl", 2000)), q.get("force") == "1"))
+            if u.path == "/api/safety":
+                return self._json(safety.token_safety(q.get("mint") or "", q.get("force") == "1"))
+            if u.path == "/api/health":
+                return self._json(health_report(self.cfg, float(q.get("days", 30))))
+            if u.path == "/api/il_breakeven":
+                return self._json(safety.il_breakeven(
+                    float(q.get("size", 8)), float(q.get("bottom", 70)),
+                    float(q["fee1h"]) if q.get("fee1h") not in (None, "") else None,
+                    int(q.get("slices", 5)),
+                ))
             if u.path == "/api/leftovers":
                 wallet = q.get("wallet") or (node.trade_wallet().get("pubkey"))
                 if not wallet:
@@ -1108,6 +1360,7 @@ class Handler(BaseHTTPRequestHandler):
                 tw = node.trade_wallet() if not node.ready() else {"ok": False}
                 return self._json({"cfg": self.cfg, "wallet": tw.get("pubkey") or os.environ.get("DLMM_WALLET"),
                                    "maxPositionSol": filters.max_position_sol(self.cfg), "executor": node.ready(),
+                                   "paused": is_paused(),
                                    "trade": {"enabled": bool(tw.get("ok")), "wallet": tw.get("pubkey"),
                                              "error": None if tw.get("ok") or not node.key_configured() else tw.get("error"),
                                              "pin": bool(os.environ.get("DLMM_WEB_PIN")), "local": self._is_local(),
@@ -1224,6 +1477,44 @@ class Handler(BaseHTTPRequestHandler):
                 res = narrative.research(mint, str(body.get("symbol") or ""), self.cfg, pool=body.get("pool"), extra=extra,
                                          force=bool(body.get("force")))
                 return self._json(res)
+            if self.path == "/api/narrative/batch":
+                why = self._trade_refused(body)
+                if why:
+                    return self._json({"ok": False, "error": why}, 403)
+                items = (body.get("items") or [])[:5]
+                if not items:
+                    return self._json({"ok": False, "error": "daftar token kosong"}, 400)
+                job = node.job_start(f"Riset narasi batch ({len(items)} koin)", "manual")
+                cfg = self.cfg
+
+                def _batch_work():
+                    done_ok = 0
+                    with node.job_context(job):
+                        for i, it in enumerate(items, 1):
+                            sym = str(it.get("symbol") or it.get("mint", "")[:6])
+                            node.job_step(f"[{i}/{len(items)}] riset {sym}…")
+                            extra = {k: it.get(k) for k in ("mcapUsd", "priceChg1h", "priceChg24h", "vol24hUsd") if it.get(k) is not None}
+                            r = narrative.research(str(it["mint"]), sym, cfg, pool=it.get("pool"), extra=extra, force=bool(body.get("force")))
+                            if r.get("ok"):
+                                done_ok += 1
+                                node.job_step(f"✓ {sym}: {r.get('tag') or '?'}", True)
+                            else:
+                                node.job_step(f"✗ {sym}: {(r.get('error') or 'gagal')[:120]}", False)
+                        # drop pool cache so narrativeTag badges appear right away
+                        with _lock:
+                            for k in [k for k in _cache if isinstance(k, tuple) and k[0] == "pools"]:
+                                _cache.pop(k, None)
+                    node.job_finish(job, {"ok": done_ok > 0, "done": done_ok, "total": len(items)})
+
+                threading.Thread(target=_batch_work, daemon=True).start()
+                return self._json({"ok": True, "jobId": job["id"], "title": job["title"]})
+            if self.path == "/api/pause":
+                why = self._trade_refused(body)
+                if why:
+                    return self._json({"ok": False, "error": why}, 403)
+                val = bool(body["paused"]) if "paused" in body else (not is_paused())
+                set_paused(val)
+                return self._json({"ok": True, "paused": val})
             if self.path == "/api/autoreentry":
                 why = self._trade_refused(body)
                 if why:
@@ -1277,9 +1568,19 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(cfg: dict, host: str = "127.0.0.1", port: int = 8891, config_path: str | None = None) -> None:
+    import sys
     Handler.cfg = cfg
     Handler.config_path = config_path
-    threading.Thread(target=_auto_loop, args=(cfg,), daemon=True).start()   # auto exit (TP) for armed ladders
+    this_mod = sys.modules[__name__]
+    # Independent daemon threads so a slow re-entry never blocks auto-exit, flip, PICK scanner, or Telegram bot
+    for fn, args in (
+        (_loop_auto_exit, (cfg,)),
+        (_loop_flip, (cfg,)),
+        (_loop_reentry, (cfg,)),
+        (_loop_pick_bg, (cfg,)),
+        (tgbot.poll_loop, (cfg, this_mod, _mark_health)),
+    ):
+        threading.Thread(target=fn, args=args, daemon=True).start()
     srv = ThreadingHTTPServer((host, port), Handler)
     print(f"DLMM terminal web → http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}  (Ctrl+C to stop)")
     try:
